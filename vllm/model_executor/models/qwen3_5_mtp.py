@@ -1,3 +1,4 @@
+import os
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model."""
@@ -78,6 +79,8 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
 
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
+        qwopus_bf16_mtp = os.environ.get("VLLM_QWOPUS_MTP_BF16_DRAFT") == "1"
+        quant_name = quant_config.get_name() if quant_config else None
 
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
@@ -88,11 +91,24 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         # missing from hf_quant_config.json exclude_modules. Force unquantized.
         # Ref: https://github.com/vllm-project/vllm/pull/38650
         # Ref: https://github.com/NVIDIA/Model-Optimizer/pull/1124
+        # Keep the FP8 draft layer quantized. The BF16 fc workaround is meant
+        # for checkpoints whose MTP fc is intentionally stored outside the
+        # target quantization scheme (for example FP4/NVFP4 variants).
         fc_quant = (
             None
-            if (quant_config and quant_config.get_name() == "modelopt_fp4")
+            if (
+                quant_name == "modelopt_fp4"
+                or (qwopus_bf16_mtp and quant_name != "fp8")
+            )
             else quant_config
         )
+        if qwopus_bf16_mtp:
+            logger.info(
+                "VLLM_QWOPUS_MTP_BF16_DRAFT=1: loading Qwen3.5 MTP "
+                "draft fc without the target quantization config when needed; "
+                "draft layer quantization=%s",
+                quant_name or "disabled",
+            )
         self.fc = ColumnParallelLinear(
             self.config.hidden_size * 2,
             self.config.hidden_size,

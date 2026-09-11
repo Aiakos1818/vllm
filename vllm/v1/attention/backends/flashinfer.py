@@ -460,12 +460,11 @@ class FlashInferBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        # FlashInfer supports SM75+, but is currently broken on SM75 (Turing):
-        # https://github.com/flashinfer-ai/flashinfer/issues/3620 (fix:
-        # https://github.com/flashinfer-ai/flashinfer/pull/3621). Temporarily
-        # raise the floor to SM80 so it is not auto-selected on SM75 until
-        # that fix lands; revert to DeviceCapability(7, 5) once it does.
-        return capability >= DeviceCapability(8, 0) and capability <= DeviceCapability(
+        # Local Qwopus/2080 Ti override: FlashInfer 0.6.12 is pinned for the
+        # 0.24.0 upgrade and the SM75 path is required to match the 0.23.x
+        # performance baseline. Upstream temporarily raised this floor to SM80
+        # while waiting for the SM75 fix; keep SM75 enabled for this deployment.
+        return capability >= DeviceCapability(7, 5) and capability <= DeviceCapability(
             12, 1
         )
 

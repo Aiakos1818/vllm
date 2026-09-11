@@ -124,6 +124,20 @@ class InputProcessor:
                         "model runner. Run vLLM with VLLM_USE_V2_MODEL_RUNNER=0 "
                         "to use thinking_token_budget."
                     )
+            elif (
+                self.vllm_config.reasoning_config is not None
+                and self.vllm_config.reasoning_config.enabled
+                and not self.use_v2_model_runner
+                and getattr(
+                    self.vllm_config.reasoning_config,
+                    "default_thinking_token_budget",
+                    None,
+                )
+                is not None
+            ):
+                params.thinking_token_budget = (
+                    self.vllm_config.reasoning_config.default_thinking_token_budget
+                )
         elif isinstance(params, PoolingParams):
             supported_pooling_tasks = [
                 task for task in supported_tasks if task in POOLING_TASKS

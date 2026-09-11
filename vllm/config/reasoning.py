@@ -26,6 +26,10 @@ class ReasoningConfig:
     reasoning_end_str: str = ""
     """String that indicates the end of reasoning content."""
 
+    default_thinking_token_budget: int | None = None
+    """Server-side default for thinking_token_budget. Overridden by per-request
+    thinking_token_budget in SamplingParams. Set to None to disable."""
+
     _reasoning_start_token_ids: list[int] | None = field(
         default=None, init=False, repr=False
     )

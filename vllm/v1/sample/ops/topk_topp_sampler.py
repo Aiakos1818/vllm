@@ -54,9 +54,21 @@ def flashinfer_sampler_supported() -> bool:
     assert capability is not None
     unsupported_reason: str | None = None
     if not FlashInferBackend.supports_compute_capability(capability):
-        unsupported_reason = (
-            f"unsupported compute capability {capability.as_version_str()}"
-        )
+        # Allow local SM75/2080 Ti deployments that have validated
+        # FlashInfer top-p/top-k sampling with the pinned FlashInfer runtime.
+        # The generic FlashInfer attention backend gate is stricter than this
+        # sampler path needs on Qwopus/Qwen3.5 FP8.
+        if capability.major == 7 and capability.minor >= 5:
+            logger.info_once(
+                "Using FlashInfer top-p/top-k sampling on local SM75 override "
+                "(compute capability %s).",
+                capability.as_version_str(),
+                scope="global",
+            )
+        else:
+            unsupported_reason = (
+                f"unsupported compute capability {capability.as_version_str()}"
+            )
 
     if unsupported_reason is None:
         logger.info_once("Using FlashInfer for top-p & top-k sampling.", scope="global")

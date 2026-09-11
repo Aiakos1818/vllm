@@ -84,7 +84,7 @@ logger = init_logger(__name__)
 
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
+) -> tuple[str, Literal["triton", "flashinfer", "cutedsl", "flashqla_legacy"]]:
     """Resolve GDN prefill backend.
 
     FlashInfer's GDN prefill kernel is chosen when:
@@ -126,6 +126,8 @@ def _resolve_gdn_prefill_backend(
         supports_flashinfer = True
         supports_cutedsl = True
 
+    if backend == "flashqla_legacy":
+        return backend, "flashqla_legacy"
     if backend in ["flashinfer", "auto"] and supports_flashinfer:
         return backend, "flashinfer"
     if backend == "cutedsl" and supports_cutedsl:
@@ -146,6 +148,7 @@ def _log_gdn_backend_decision(
         "flashinfer": "FlashInfer",
         "cutedsl": "CuteDSL",
         "triton": "Triton/FLA",
+        "flashqla_legacy": "FlashQLA legacy (SM70/SM75)",
     }[active_backend]
     logger.info_once(
         "Using %s GDN prefill kernel (requested=%s, head_k_dim=%s).",
@@ -158,6 +161,96 @@ def _log_gdn_backend_decision(
             "FlashInfer GDN prefill is JIT-compiled; first run may take a "
             "while. Set --gdn-prefill-backend triton to skip JIT.",
         )
+
+
+
+def flashqla_legacy_chunk_gated_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor | None = None,
+    use_qk_l2norm_in_kernel: bool = True,
+):
+    """FlashQLA legacy GDN prefill for SM70/SM75 (2080 Ti)."""
+    from flash_qla.ops.gated_delta_rule.legacy import (
+        chunk_gated_delta_rule_fwd_legacy,
+    )
+
+    if use_qk_l2norm_in_kernel:
+        q = l2norm_fwd(q)
+        k = l2norm_fwd(k)
+
+    scale = q.shape[-1] ** -0.5
+
+    def run_one(start: int | None = None, end: int | None = None, state_idx: int = 0):
+        seq = slice(start, end) if start is not None else slice(None)
+        output, final_state = chunk_gated_delta_rule_fwd_legacy(
+            q[:, seq].to(torch.float32).contiguous(),
+            k[:, seq].to(torch.float32).contiguous(),
+            v[:, seq].to(torch.float32).contiguous(),
+            g[:, seq].to(torch.float32).contiguous(),
+            beta[:, seq].to(torch.float32).contiguous(),
+            scale,
+            initial_state[state_idx : state_idx + 1].to(torch.float32).contiguous(),
+        )
+        return output.to(v.dtype), final_state
+
+    if cu_seqlens is None:
+        output, final_state = run_one()
+        if output_final_state:
+            return output, final_state
+        return output, None
+
+    cu = cu_seqlens.detach().cpu().tolist()
+    if len(cu) == 2 and cu[0] == 0 and cu[1] == q.shape[1]:
+        output, final_state = run_one()
+        if output_final_state:
+            return output, final_state
+        return output, None
+
+    if q.shape[0] != 1:
+        raise NotImplementedError(
+            "FlashQLA legacy ragged GDN prefill expects packed q/k/v "
+            "with batch dimension 1"
+        )
+    if cu[0] != 0 or cu[-1] != q.shape[1]:
+        raise ValueError("cu_seqlens must cover the packed GDN prefill tokens")
+
+    num_sequences = len(cu) - 1
+    if initial_state.shape[0] not in (1, num_sequences):
+        raise ValueError(
+            "initial_state first dimension must be 1 or match "
+            "the number of packed GDN prefill sequences"
+        )
+
+    outputs = []
+    final_states = []
+    for seq_idx, (start, end) in enumerate(zip(cu[:-1], cu[1:])):
+        if end <= start:
+            continue
+        state_idx = seq_idx if initial_state.shape[0] == num_sequences else 0
+        seq_output, seq_final_state = run_one(start, end, state_idx)
+        outputs.append(seq_output)
+        final_states.append(seq_final_state)
+
+    if not outputs:
+        output = torch.empty(
+            (q.shape[0], 0, v.shape[2], v.shape[3]),
+            device=v.device,
+            dtype=v.dtype,
+        )
+        final_state = initial_state[:0] if output_final_state else None
+    else:
+        output = torch.cat(outputs, dim=1)
+        final_state = torch.cat(final_states, dim=0)
+
+    if output_final_state:
+        return output, final_state
+    return output, None
 
 
 def fi_chunk_gated_delta_rule(
@@ -229,6 +322,8 @@ class ChunkGatedDeltaRule(CustomOp):
             self._forward_method = self.forward_cuda
         elif active_backend == "cutedsl":
             self._forward_method = self.forward_cutedsl
+        elif active_backend == "flashqla_legacy":
+            self._forward_method = self.forward_flashqla_legacy
         else:
             self._forward_method = self.forward_native
 
@@ -337,6 +432,38 @@ class ChunkGatedDeltaRule(CustomOp):
             final_state = None
         return o, final_state
 
+
+    def forward_flashqla_legacy(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+    ):
+        o, final_state = flashqla_legacy_chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        if core_attn_out is not None:
+            o_flat = o.squeeze(0).reshape(-1)
+            co_flat = core_attn_out.reshape(-1)
+            co_flat[: o_flat.numel()].copy_(o_flat)
+        return o, final_state
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
