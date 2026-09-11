@@ -6,6 +6,8 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -31,6 +33,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -127,7 +131,15 @@ class SingleTypeKVCacheManager(ABC):
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
-        return sum(blk.ref_cnt == 0 and not blk.is_null for blk in blocks)
+        # Only blocks sitting in the free queue (ref_cnt == 0) consume free
+        # capacity when a hit touches them. Keep-alive pinned blocks have
+        # ref_cnt == 0 but are withdrawn from the free queue, so counting them
+        # would inflate the admission gate and can deadlock a resumed request
+        # (its pinned prefix is charged as if it needed fresh blocks).
+        return sum(
+            blk.ref_cnt == 0 and not blk.is_null and blk.pinned == 0
+            for blk in blocks
+        )
 
     def _has_partial_local_hit(
         self,
@@ -1275,6 +1287,31 @@ class MambaManager(SingleTypeKVCacheManager):
             # into a private cow_block; we record that block for connector
             # offload (see _pending_partial_tail_offloads).
             self._producer_partial_tail_reqs: dict[str, int] = {}
+            # Durable snapshot cadence (tokens, 0=off, old rolling behaviour):
+            # state blocks whose end token is a positive multiple of this are
+            # NOT freed with the rolling window; they are pinned and kept in the
+            # prefix-cache so a later request can resume from that interior
+            # boundary (interior-divergence reuse) instead of recomputing the
+            # whole prefix. The scheduler stops prefill chunks exactly on these
+            # boundaries so a real state snapshot is flushed there.
+            ckpt_tokens = envs.VLLM_MAMBA_CKPT_TOKENS
+            if ckpt_tokens and ckpt_tokens % self.block_size != 0:
+                logger.warning(
+                    "VLLM_MAMBA_CKPT_TOKENS=%s is not a multiple of mamba "
+                    "block_size=%s; disabling durable mamba snapshots.",
+                    ckpt_tokens, self.block_size,
+                )
+                ckpt_tokens = 0
+            self._ckpt_tokens = ckpt_tokens
+            # Per-request rolling window of durable (pinned) snapshot anchors.
+            # Anchors are retained newest-first and capped at ``_ckpt_anchors``;
+            # once the cap is reached, keeping a new anchor releases the oldest
+            # one so the net in-flight footprint of this request stays flat.
+            # That bounded footprint is what prevents the ~1.04x-concurrency
+            # pool from being drained mid-prefill (which previously deadlocked
+            # a single long prefill at small cadences).
+            self._ckpt_anchors = max(1, envs.VLLM_MAMBA_CKPT_ANCHORS)
+            self._durable_win: dict[str, list[KVCacheBlock]] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -1440,8 +1477,54 @@ class MambaManager(SingleTypeKVCacheManager):
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
+                    blk = blocks[last_state_block_idx]
+                    # Durable snapshot retention: a state block whose end token
+                    # is a positive multiple of the cadence holds a real SSM
+                    # snapshot at an interior boundary the scheduler stops on.
+                    # Keep it (pinned, hash stays in the prefix cache) instead
+                    # of freeing it, so a later request truncated/diverging past
+                    # this boundary can resume from it.
+                    end_tokens = (last_state_block_idx + 1) * self.block_size
+                    if (
+                        self._ckpt_tokens
+                        and end_tokens % self._ckpt_tokens == 0
+                        and end_tokens <= processed_computed_tokens
+                    ):
+                        self.block_pool.pin_block(blk)
+                        win = self._durable_win.setdefault(request_id, [])
+                        win.append(blk)
+                        if len(win) > self._ckpt_anchors:
+                            # Keep the MOST RECENT anchors (reverts target the
+                            # tail); retire the oldest one to keep this
+                            # request's in-flight footprint flat.
+                            oldest = win.pop(0)
+                            self._release_durable_anchor(oldest)
+                    else:
+                        self.block_pool.free_blocks([blk])
                     blocks[last_state_block_idx] = self._null_block
+
+    def _release_durable_anchor(self, blk: KVCacheBlock) -> None:
+        """Turn a durable (pinned during its owner's run) anchor back into an
+        ordinary cached block: drop the keep-alive hold and free the block so
+        it re-enters the free queue with its hash (reusable by prefix cache,
+        evictable under pool pressure). Without this the anchor would stay
+        pinned forever and permanently shrink the pool."""
+        self.block_pool.unpin_block(blk)
+        self.block_pool.free_blocks([blk])
+
+    def take_durable_window(self, request_id: str) -> list[KVCacheBlock]:
+        """Hand over this request's surviving durable anchors to the caller
+        (keep-alive promotion) WITHOUT releasing them.
+
+        The anchors stay pinned (as they have been during the run). The caller
+        is responsible for making them ref-idle-pinned and for counting them,
+        so that they share the request's keep-alive pin entry lifecycle: they
+        are unpinned only when that entry is released under pool pressure.
+        Returns [] when the request has no anchors (feature off / none left).
+        """
+        if self.mamba_cache_mode != "align" or not self._ckpt_tokens:
+            return []
+        return self._durable_win.pop(request_id, [])
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
@@ -1468,6 +1551,18 @@ class MambaManager(SingleTypeKVCacheManager):
             # To put it in the next step, we return num_gpu_blocks + 1 so
             # that kv_cache_manager will think there is no enough blocks to allocate now
             # and don't schedule it in the current step.
+            if envs.RAMTRACE:
+                try:
+                    with open(
+                        envs.RAMTRACE_LOG, "a"
+                    ) as _f:
+                        _f.write(
+                            f"mamba defer req={request_id} "
+                            f"tail={new_computed_blocks[-1].block_hash} "
+                            f"nsteps={len(self.cached_blocks_this_step)}\n"
+                        )
+                except Exception:
+                    pass
             return self.block_pool.num_gpu_blocks + 1
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
@@ -1655,6 +1750,13 @@ class MambaManager(SingleTypeKVCacheManager):
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
+            # Release this request's durable anchors now that it is finished:
+            # they become ordinary cached blocks (reusable / evictable) instead
+            # of staying pinned forever.
+            win = self._durable_win.pop(request_id, None)
+            if win:
+                for blk in win:
+                    self._release_durable_anchor(blk)
             # A hand-off whose request died in this same scheduling pass must
             # not reach the connector: its unpin hook (free) has already run.
             self._pending_partial_tail_offloads = [

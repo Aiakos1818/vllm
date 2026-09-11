@@ -69,9 +69,9 @@ class SharedOffloadRegion:
             os.ftruncate(self.fd, self.total_size_bytes)
             self._creator = True
             logger.info(
-                "Created mmap file %s (%.2f GB)",
+                "Created mmap file %s (%.2f GiB)",
                 self.mmap_path,
-                self.total_size_bytes / 1e9,
+                self.total_size_bytes / (1 << 30),
             )
         except FileExistsError:
             self.fd = os.open(self.mmap_path, os.O_RDWR)

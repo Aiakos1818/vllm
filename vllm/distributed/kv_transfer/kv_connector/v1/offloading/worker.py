@@ -329,6 +329,15 @@ class OffloadingConnectorWorker:
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
             assert success
 
+        # External spill/restore loads are executed but intentionally NOT put
+        # into _load_jobs, so they never surface through finished_recving (the
+        # core scheduler resolves them itself). get_finished() still reports
+        # their job completion via completed_jobs.
+        for job_id, entry in (metadata.external_load_jobs or {}).items():
+            assert isinstance(entry.dst_spec, GPULoadStoreSpec)
+            success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
+            assert success
+
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
             if not self._is_store_writer:

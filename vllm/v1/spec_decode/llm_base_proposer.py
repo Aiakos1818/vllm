@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.config import (
     CUDAGraphMode,
@@ -593,6 +594,19 @@ class SpecDecodeBaseProposer:
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
+            if envs.RAMTRACE:
+                try:
+                    with open(
+                        envs.RAMTRACE_LOG, "a"
+                    ) as _f:
+                        _f.write(
+                            f"NAN draft hidden "
+                            f"last={int(last_hidden_states.isnan().sum())} "
+                            f"hid={int(hidden_states.isnan().sum())} "
+                            f"shape={tuple(hidden_states.shape)}\n"
+                        )
+                except Exception:
+                    pass
 
         # After step 0: switch to reuse mode so steps 1+ skip the indexer
         # and read the indices that step 0 just wrote into the shared buffer.

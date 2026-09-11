@@ -67,6 +67,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
 
         offloading_config = build_offloading_config(vllm_config, kv_cache_config)
         spec = OffloadingSpecFactory.create_spec(offloading_config)
+        self._spec = spec
 
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
@@ -78,6 +79,19 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector_worker = OffloadingConnectorWorker(
                 spec, vllm_config, kv_cache_config
             )
+
+    def cpu_capacity(self) -> int:
+        """Number of host-tier CPU slots available (per worker)."""
+        return self._spec.num_blocks
+
+    def cpu_engine_id(self) -> str:
+        """Engine id naming this instance's shared host KV region."""
+        return self._spec.config.engine_id
+
+    def create_scheduler_kv_region(self):
+        """Scheduler-side zero-copy view of the shared host KV region."""
+        create = getattr(self._spec, "create_scheduler_view", None)
+        return create() if create is not None else None
 
     def shutdown(self) -> None:
         if self.connector_worker is not None:
@@ -167,6 +181,18 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def has_pending_push_work(self) -> bool:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.has_pending_push_work()
+
+    def add_external_store(self, src_spec, dst_spec) -> int:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.add_external_store(src_spec, dst_spec)
+
+    def add_external_load(self, src_spec, dst_spec) -> int:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.add_external_load(src_spec, dst_spec)
+
+    def take_external_completed(self) -> list[int]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.take_external_completed()
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None

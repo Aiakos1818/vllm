@@ -122,6 +122,10 @@ class KVCacheBlock:
     block_id: int
     # Reference count.
     ref_cnt: int = 0
+    # Keep-alive pin count: pinned blocks are withdrawn from the free/eviction
+    # queue so cache pressure never reuses them (auto keep-alive of long
+    # sessions). Only ever 0 (unpinned) or >0 (pinned).
+    pinned: int = 0
     # The hash key (block hash + group id) of the block, only available
     # when the block is full and cached.
     _block_hash: BlockHashWithGroupId | None = None

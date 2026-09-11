@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
+    LoadStoreSpec,
     Locality,
     LookupResult,
     Medium,
@@ -498,7 +499,21 @@ class OffloadingConnectorScheduler:
         self._stale_job_threshold: int = 0
         self._jobs: dict[int, TransferJobStatus] = {}
 
-        # block_id -> pending store job_ids. Used to track jobs that needs
+        # External (host-tier spill/restore) transfers: not tracked by
+        # req_status / manager. Pending stores are merged into the meta's
+        # store_jobs; pending loads into external_load_jobs. Completion is
+        # resolved by worker completed_jobs counts (per worker) and surfaced
+        # through take_external_completed().
+        self._external_store_jobs: dict[int, TransferJob] = {}
+        self._external_load_jobs: dict[int, TransferJob] = {}
+        self._external_pending: dict[int, int] = {}
+        self._external_done: list[int] = []
+        self._external_inflight: dict[int, int] = {}
+        # When the host-tier (external) spill tier is active, the connector is
+        # used ONLY as a copy channel: its native per-request offload is
+        # disabled, because its slot allocator would otherwise overwrite the
+        # external tier's parked slots (both index the same CPU buffer).
+        self.native_store_enabled = True
         # flushing in case a block is re-allocated by the KV cache manager.
         # Populated only for finished requests (running-request blocks are
         # protected by their ref_cnt) and for sliding window blocks (which can
@@ -1248,10 +1263,25 @@ class OffloadingConnectorScheduler:
                 for jid in self._block_id_to_pending_jobs[bid]
             )
 
+        store_jobs = (
+            self._build_store_jobs(scheduler_output)
+            if self.native_store_enabled
+            else {}
+        )
+        # Inject pending external spill stores exactly once: the worker defers
+        # store submission by a step itself, so re-injecting would submit the
+        # same job id twice (duplicate completion events).
+        if self._external_store_jobs:
+            store_jobs.update(self._external_store_jobs)
+            self._external_store_jobs = {}
+        external_load_jobs = self._external_load_jobs
+        self._external_load_jobs = {}
+
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
-            store_jobs=self._build_store_jobs(scheduler_output),
+            store_jobs=store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
+            external_load_jobs=external_load_jobs,
         )
 
         # All prepare_store calls for finished requests have been issued.
@@ -1275,7 +1305,38 @@ class OffloadingConnectorScheduler:
         While True, build_connector_meta() and update_connector_output()
         continue to be called even when no requests are scheduled.
         """
-        return bool(self._jobs) or self.manager.has_pending_work()
+        return bool(self._jobs) or self.manager.has_pending_work() or bool(
+            self._external_inflight
+        )
+
+    def add_external_store(self, src_spec: LoadStoreSpec,
+                           dst_spec: LoadStoreSpec) -> int:
+        """Queue a host-tier spill (GPU->CPU) bypassing request bookkeeping."""
+        job_id = self._job_counter
+        self._job_counter += 1
+        self._external_store_jobs[job_id] = TransferJob(
+            req_id=f"ext-store-{job_id}", src_spec=src_spec, dst_spec=dst_spec
+        )
+        self._external_pending[job_id] = self.config.num_workers
+        self._external_inflight[job_id] = self.config.num_workers
+        return job_id
+
+    def add_external_load(self, src_spec: LoadStoreSpec,
+                          dst_spec: LoadStoreSpec) -> int:
+        """Queue a host-tier restore (CPU->GPU) bypassing request bookkeeping."""
+        job_id = self._job_counter
+        self._job_counter += 1
+        self._external_load_jobs[job_id] = TransferJob(
+            req_id=f"ext-load-{job_id}", src_spec=src_spec, dst_spec=dst_spec
+        )
+        self._external_pending[job_id] = self.config.num_workers
+        self._external_inflight[job_id] = self.config.num_workers
+        return job_id
+
+    def take_external_completed(self) -> list[int]:
+        done = self._external_done
+        self._external_done = []
+        return done
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
@@ -1321,6 +1382,14 @@ class OffloadingConnectorScheduler:
 
         for job_id, count in meta.completed_jobs.items():
             assert count > 0
+            if job_id in self._external_inflight:
+                # External spill/restore job: resolve purely on worker counts.
+                self._external_inflight[job_id] -= count
+                if self._external_inflight[job_id] <= 0:
+                    del self._external_inflight[job_id]
+                    self._external_pending.pop(job_id, None)
+                    self._external_done.append(job_id)
+                continue
             if job_id < self._stale_job_threshold:
                 logger.debug(
                     "Skipping stale completed job %d (pre-reset counter: %d)",

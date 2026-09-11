@@ -206,6 +206,32 @@ class SchedulerStats:
     spec_decoding_stats: SpecDecodingStats | None = None
     kv_connector_stats: dict[str, Any] | None = None
 
+    # Host-tier (RAM) session spill/restore and keep-alive pinning. Counters
+    # are per-report deltas; the rest are gauges sampled each report.
+    host_tier_slots_total: int = 0
+    host_tier_slots_used: int = 0
+    host_tier_sessions: int = 0
+    host_tier_spills: int = 0
+    host_tier_restores: int = 0
+    host_tier_evictions: int = 0
+    host_tier_drops: int = 0
+    keep_alive_entries: int = 0
+    keep_alive_blocks: int = 0
+    keep_alive_tokens: int = 0
+    keep_alive_anchors: int = 0
+    keep_alive_anchor_sessions: int = 0
+
+    # Host-tier (SSD) session parking: gauges + per-report counter deltas.
+    host_tier_ssd_sessions: int = 0
+    host_tier_ssd_bytes_used: int = 0
+    host_tier_ssd_quota_bytes: int = 0
+    host_tier_ssd_stores: int = 0
+    host_tier_ssd_restores: int = 0
+    host_tier_ssd_evictions: int = 0
+    host_tier_ssd_drops: int = 0
+    host_tier_ssd_write_bytes: int = 0
+    host_tier_ssd_read_bytes: int = 0
+
     waiting_lora_adapters: dict[str, int] = field(default_factory=dict)
     running_lora_adapters: dict[str, int] = field(default_factory=dict)
 

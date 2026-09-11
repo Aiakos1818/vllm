@@ -70,6 +70,12 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     load_jobs: dict[int, TransferJob]
     store_jobs: dict[int, TransferJob]
     jobs_to_flush: set[int] | None = None
+    # External (host-tier spill/restore) transfers injected by the core
+    # scheduler, bypassing this connector's request/manager bookkeeping.
+    # Stores reuse ``store_jobs``; loads live in a separate bucket so the
+    # worker never reports them through ``finished_recving`` (the core
+    # scheduler resolves their completion itself via completed_jobs).
+    external_load_jobs: dict[int, TransferJob] | None = None
 
 
 @dataclass

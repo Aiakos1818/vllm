@@ -630,6 +630,216 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         #
+        # Host-tier (RAM) session spill/restore + keep-alive pinning
+        #
+
+        gauge_host_tier_slots_used = self._gauge_cls(
+            name="vllm:host_tier_slots_used",
+            documentation="Host-tier (RAM) KV slots currently in use.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_host_tier_slots_used = create_metric_per_engine(
+            gauge_host_tier_slots_used, per_engine_labelvalues
+        )
+
+        gauge_host_tier_slots_total = self._gauge_cls(
+            name="vllm:host_tier_slots_total",
+            documentation="Total host-tier (RAM) KV slots configured.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_host_tier_slots_total = create_metric_per_engine(
+            gauge_host_tier_slots_total, per_engine_labelvalues
+        )
+
+        gauge_host_tier_sessions = self._gauge_cls(
+            name="vllm:host_tier_sessions",
+            documentation="Number of sessions parked on the host (RAM) tier.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_host_tier_sessions = create_metric_per_engine(
+            gauge_host_tier_sessions, per_engine_labelvalues
+        )
+
+        gauge_keep_alive_entries = self._gauge_cls(
+            name="vllm:keep_alive_entries",
+            documentation="Number of keep-alive pinned sessions.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_keep_alive_entries = create_metric_per_engine(
+            gauge_keep_alive_entries, per_engine_labelvalues
+        )
+
+        gauge_keep_alive_blocks = self._gauge_cls(
+            name="vllm:keep_alive_blocks",
+            documentation="Number of KV blocks held by keep-alive pinning.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_keep_alive_blocks = create_metric_per_engine(
+            gauge_keep_alive_blocks, per_engine_labelvalues
+        )
+
+        gauge_keep_alive_tokens = self._gauge_cls(
+            name="vllm:keep_alive_tokens",
+            documentation="Number of cache tokens held by keep-alive pinning.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_keep_alive_tokens = create_metric_per_engine(
+            gauge_keep_alive_tokens, per_engine_labelvalues
+        )
+
+        gauge_keep_alive_anchors = self._gauge_cls(
+            name="vllm:keep_alive_anchors",
+            documentation="Number of durable Mamba anchor blocks held by "
+            "keep-alive pinning.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_keep_alive_anchors = create_metric_per_engine(
+            gauge_keep_alive_anchors, per_engine_labelvalues
+        )
+
+        gauge_keep_alive_anchor_sessions = self._gauge_cls(
+            name="vllm:keep_alive_anchor_sessions",
+            documentation="Number of keep-alive pinned sessions holding at "
+            "least one durable Mamba anchor.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_keep_alive_anchor_sessions = create_metric_per_engine(
+            gauge_keep_alive_anchor_sessions, per_engine_labelvalues
+        )
+
+        counter_host_tier_spills = self._counter_cls(
+            name="vllm:host_tier_spills",
+            documentation="Sessions stored from GPU to the host (RAM) tier.",
+            labelnames=labelnames,
+        )
+        self.counter_host_tier_spills = create_metric_per_engine(
+            counter_host_tier_spills, per_engine_labelvalues
+        )
+
+        counter_host_tier_restores = self._counter_cls(
+            name="vllm:host_tier_restores",
+            documentation="Sessions loaded from the host (RAM) tier to GPU.",
+            labelnames=labelnames,
+        )
+        self.counter_host_tier_restores = create_metric_per_engine(
+            counter_host_tier_restores, per_engine_labelvalues
+        )
+
+        counter_host_tier_evictions = self._counter_cls(
+            name="vllm:host_tier_evictions",
+            documentation=(
+                "Parked sessions dropped from the host tier to make room."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_host_tier_evictions = create_metric_per_engine(
+            counter_host_tier_evictions, per_engine_labelvalues
+        )
+
+        counter_host_tier_drops = self._counter_cls(
+            name="vllm:host_tier_drops",
+            documentation=(
+                "Sessions released directly because they did not fit the host tier."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_host_tier_drops = create_metric_per_engine(
+            counter_host_tier_drops, per_engine_labelvalues
+        )
+
+        gauge_host_tier_ssd_sessions = self._gauge_cls(
+            name="vllm:host_tier_ssd_sessions",
+            documentation="Parked sessions living on the SSD host tier.",
+            labelnames=labelnames,
+        )
+        self.gauge_host_tier_ssd_sessions = create_metric_per_engine(
+            gauge_host_tier_ssd_sessions, per_engine_labelvalues
+        )
+
+        gauge_host_tier_ssd_bytes_used = self._gauge_cls(
+            name="vllm:host_tier_ssd_bytes_used",
+            documentation="Bytes used by parked sessions on the SSD host tier.",
+            labelnames=labelnames,
+        )
+        self.gauge_host_tier_ssd_bytes_used = create_metric_per_engine(
+            gauge_host_tier_ssd_bytes_used, per_engine_labelvalues
+        )
+
+        gauge_host_tier_ssd_quota_bytes = self._gauge_cls(
+            name="vllm:host_tier_ssd_quota_bytes",
+            documentation="Configured SSD host tier quota in bytes.",
+            labelnames=labelnames,
+        )
+        self.gauge_host_tier_ssd_quota_bytes = create_metric_per_engine(
+            gauge_host_tier_ssd_quota_bytes, per_engine_labelvalues
+        )
+
+        counter_host_tier_ssd_stores = self._counter_cls(
+            name="vllm:host_tier_ssd_stores",
+            documentation="Sessions successfully written to the SSD host tier.",
+            labelnames=labelnames,
+        )
+        self.counter_host_tier_ssd_stores = create_metric_per_engine(
+            counter_host_tier_ssd_stores, per_engine_labelvalues
+        )
+
+        counter_host_tier_ssd_restores = self._counter_cls(
+            name="vllm:host_tier_ssd_restores",
+            documentation="Sessions successfully restored from the SSD host tier.",
+            labelnames=labelnames,
+        )
+        self.counter_host_tier_ssd_restores = create_metric_per_engine(
+            counter_host_tier_ssd_restores, per_engine_labelvalues
+        )
+
+        counter_host_tier_ssd_evictions = self._counter_cls(
+            name="vllm:host_tier_ssd_evictions",
+            documentation=(
+                "Sessions evicted from the SSD host tier because the quota "
+                "was reached."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_host_tier_ssd_evictions = create_metric_per_engine(
+            counter_host_tier_ssd_evictions, per_engine_labelvalues
+        )
+
+        counter_host_tier_ssd_drops = self._counter_cls(
+            name="vllm:host_tier_ssd_drops",
+            documentation="Sessions dropped instead of parked on the SSD host tier.",
+            labelnames=labelnames,
+        )
+        self.counter_host_tier_ssd_drops = create_metric_per_engine(
+            counter_host_tier_ssd_drops, per_engine_labelvalues
+        )
+
+        counter_host_tier_ssd_write_bytes = self._counter_cls(
+            name="vllm:host_tier_ssd_write_bytes",
+            documentation="Bytes written to the SSD host tier.",
+            labelnames=labelnames,
+        )
+        self.counter_host_tier_ssd_write_bytes = create_metric_per_engine(
+            counter_host_tier_ssd_write_bytes, per_engine_labelvalues
+        )
+
+        counter_host_tier_ssd_read_bytes = self._counter_cls(
+            name="vllm:host_tier_ssd_read_bytes",
+            documentation="Bytes read from the SSD host tier.",
+            labelnames=labelnames,
+        )
+        self.counter_host_tier_ssd_read_bytes = create_metric_per_engine(
+            counter_host_tier_ssd_read_bytes, per_engine_labelvalues
+        )
+
+        #
         # Multi-modal cache
         #
 
@@ -1136,6 +1346,70 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.counter_connector_prefix_cache_hits[engine_idx].inc(
                     scheduler_stats.connector_prefix_cache_stats.hits
                 )
+
+            self.gauge_host_tier_slots_used[engine_idx].set(
+                scheduler_stats.host_tier_slots_used
+            )
+            self.gauge_host_tier_slots_total[engine_idx].set(
+                scheduler_stats.host_tier_slots_total
+            )
+            self.gauge_host_tier_sessions[engine_idx].set(
+                scheduler_stats.host_tier_sessions
+            )
+            self.gauge_keep_alive_entries[engine_idx].set(
+                scheduler_stats.keep_alive_entries
+            )
+            self.gauge_keep_alive_blocks[engine_idx].set(
+                scheduler_stats.keep_alive_blocks
+            )
+            self.gauge_keep_alive_tokens[engine_idx].set(
+                scheduler_stats.keep_alive_tokens
+            )
+            self.gauge_keep_alive_anchors[engine_idx].set(
+                scheduler_stats.keep_alive_anchors
+            )
+            self.gauge_keep_alive_anchor_sessions[engine_idx].set(
+                scheduler_stats.keep_alive_anchor_sessions
+            )
+            self.counter_host_tier_spills[engine_idx].inc(
+                scheduler_stats.host_tier_spills
+            )
+            self.counter_host_tier_restores[engine_idx].inc(
+                scheduler_stats.host_tier_restores
+            )
+            self.counter_host_tier_evictions[engine_idx].inc(
+                scheduler_stats.host_tier_evictions
+            )
+            self.counter_host_tier_drops[engine_idx].inc(
+                scheduler_stats.host_tier_drops
+            )
+            self.gauge_host_tier_ssd_sessions[engine_idx].set(
+                scheduler_stats.host_tier_ssd_sessions
+            )
+            self.gauge_host_tier_ssd_bytes_used[engine_idx].set(
+                scheduler_stats.host_tier_ssd_bytes_used
+            )
+            self.gauge_host_tier_ssd_quota_bytes[engine_idx].set(
+                scheduler_stats.host_tier_ssd_quota_bytes
+            )
+            self.counter_host_tier_ssd_stores[engine_idx].inc(
+                scheduler_stats.host_tier_ssd_stores
+            )
+            self.counter_host_tier_ssd_restores[engine_idx].inc(
+                scheduler_stats.host_tier_ssd_restores
+            )
+            self.counter_host_tier_ssd_evictions[engine_idx].inc(
+                scheduler_stats.host_tier_ssd_evictions
+            )
+            self.counter_host_tier_ssd_drops[engine_idx].inc(
+                scheduler_stats.host_tier_ssd_drops
+            )
+            self.counter_host_tier_ssd_write_bytes[engine_idx].inc(
+                scheduler_stats.host_tier_ssd_write_bytes
+            )
+            self.counter_host_tier_ssd_read_bytes[engine_idx].inc(
+                scheduler_stats.host_tier_ssd_read_bytes
+            )
 
             if scheduler_stats.spec_decoding_stats is not None:
                 self.spec_decoding_prom.observe(

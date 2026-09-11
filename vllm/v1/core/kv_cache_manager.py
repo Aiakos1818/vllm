@@ -2,19 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Any, Literal, overload
 
+from vllm import envs
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.host_tier_ssd import evict_sort_key
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    resolve_block_hashes,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -190,6 +197,28 @@ class KVCacheManager:
         # offload; pinned until the request's blocks are freed.
         self._partial_tail_pins: dict[str, list[KVCacheBlock]] = {}
 
+        # Auto keep-alive (session protection). Each entry holds the cached
+        # prefix-chain blocks of one long finished request. Pinned entries are
+        # withdrawn from the free queue so later cache pressure cannot evict /
+        # invalidate them; under admission pressure the SMALLEST entries are
+        # released first ("缓存最小的先出").
+        self._auto_pin_entries: list[dict[str, Any]] = []
+
+        # --- Host-tier session spill (RAM parking) state. ---
+        # Entries chosen for spill that are still GPU-pinned while their
+        # GPU->CPU store is in flight. Blocks are only unpinned/freed after the
+        # store completes (correctness-first ordering).
+        self._spill_hold: dict[str, dict[str, Any]] = {}
+        # Parked sessions living on the host tier: keyed by request_id.
+        self._ram_sessions: dict[str, dict[str, Any]] = {}
+        # Host-tier slot allocator, keyed by store/load job id to the entry
+        # being moved, so completion callbacks can drive the transition.
+        self._ram_capacity: int = 0
+        self._ram_free: list[tuple[int, int]] = []  # disjoint (start, len)
+        self._ram_ext_job_to_req: dict[int, str] = {}
+        # Resume requests waiting for a spill/restore load to finish.
+        self._ram_waiting: dict[str, int] = {}  # request_id -> load job id
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -262,6 +291,17 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+        if envs.RAMTRACE:
+            try:
+                with open(
+                    envs.RAMTRACE_LOG, "a"
+                ) as _f:
+                    _f.write(
+                        f"diag reconciled req={request.request_id} "
+                        f"hit={num_new_computed_tokens} uncached={num_uncached}\n"
+                    )
+            except Exception:
+                pass
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
@@ -330,6 +370,18 @@ class KVCacheManager:
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
             request.block_hashes, request.num_tokens - 1
         )
+        if envs.RAMTRACE:
+            try:
+                with open(
+                    envs.RAMTRACE_LOG, "a"
+                ) as _f:
+                    _f.write(
+                        f"diag lookup req={request.request_id} "
+                        f"groups={len(per_group_hits)} fa={fa_group_id} "
+                        f"hits={list(per_group_hits)}\n"
+                    )
+            except Exception:
+                pass
         if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
             # A lagging group hit deeper than full attention means its
             # full-attention blocks were evicted; use the reconciled boundary
@@ -485,6 +537,20 @@ class KVCacheManager:
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
+                if envs.RAMTRACE:
+                    try:
+                        with open(
+                            envs.RAMTRACE_LOG, "a"
+                        ) as _f:
+                            _f.write(
+                                f"alloc gate full req={request.request_id} "
+                                f"need={required_blocks} "
+                                f"free={self.block_pool.get_num_free_blocks()} "
+                                f"nalloc={num_blocks_to_allocate} "
+                                f"wm={watermark_blocks}\n"
+                            )
+                    except Exception:
+                        pass
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -524,6 +590,21 @@ class KVCacheManager:
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
+            if envs.RAMTRACE:
+                try:
+                    with open(
+                        envs.RAMTRACE_LOG, "a"
+                    ) as _f:
+                        _f.write(
+                            f"alloc gate req={request.request_id} "
+                            f"need={required_blocks} avail={available_blocks} "
+                            f"free={self.block_pool.get_num_free_blocks()} "
+                            f"nalloc={num_blocks_to_allocate} "
+                            f"reserved={reserved_blocks} wm={watermark_blocks} "
+                            f"ntok={num_tokens_need_slot}\n"
+                        )
+                except Exception:
+                    pass
             return None
 
         if (
@@ -576,6 +657,573 @@ class KVCacheManager:
         if pins:
             self.block_pool.free_blocks(pins)
         self.coordinator.free(request.request_id)
+
+    # ------------------------------------------------------------------ #
+    # Auto keep-alive (session protection). See ``_auto_pin_entries``.
+    # ------------------------------------------------------------------ #
+    def pin_request_auto(self, request: Request) -> int:
+        """Keep alive the whole cached prefix-chain of a finished request.
+
+        The request's own blocks (still alive here, before ``free``) become
+        pinned: they are withdrawn from the free queue and can no longer be
+        reused/evicted by other requests, so a later re-send/resume of the
+        same conversation keeps hitting the full prefix.
+
+        Returns the number of blocks pinned (0 if nothing eligible).
+        """
+        if not self.enable_caching:
+            return 0
+
+        entries: list[KVCacheBlock] = []
+        total_tokens = 0
+        managers = self.coordinator.single_type_managers
+        per_mgr: list[list[KVCacheBlock]] = [[] for _ in managers]
+        # Pin the chain across ALL single-type groups (attention + GDN/mamba):
+        # a prefix-cache chain only survives if none of its pages is reused, and
+        # reuse of a page in any group invalidates the whole chain in this build.
+        # ``block_size`` (per group, may differ) weights the entry size so
+        # release_pins_smallest can compare sessions by occupied cache tokens.
+        for mgr_idx, manager in enumerate(managers):
+            blocks = manager.req_to_blocks.get(request.request_id, ())
+            if envs.RAMTRACE:
+                try:
+                    n_nonnull = sum(1 for b in blocks if not b.is_null)
+                    n_hash = sum(1 for b in blocks if b.block_hash is not None)
+                    with open(
+                        envs.RAMTRACE_LOG, "a"
+                    ) as _f:
+                        _f.write(
+                            f"pin g{mgr_idx} all={len(blocks)} "
+                            f"nonnull={n_nonnull} hash={n_hash}\n"
+                        )
+                except Exception:
+                    pass
+            block_size = manager.block_size
+            for block in blocks:
+                if block.is_null or block.block_hash is None:
+                    continue
+                entries.append(block)
+                per_mgr[mgr_idx].append(block)
+                total_tokens += block_size
+
+        # Durable Mamba/GDN state at the reusable boundary: a restored chain
+        # resumes at the full-attention hit, but GDN is recurrent, so it needs
+        # the SSM state snapshot at that boundary. The state block is not part
+        # of ``req_to_blocks`` (superseded states are nulled there); it lives in
+        # the prefix cache keyed by the chain hash. Capture the highest cached
+        # state block at or below the attention reusable boundary so the
+        # restored request resumes with a valid recurrent state.
+        non_mamba_tokens = [
+            len(per_mgr[i]) * managers[i].block_size
+            for i, m in enumerate(managers)
+            if type(getattr(m, "kv_cache_spec", None)).__name__ != "MambaSpec"
+            and per_mgr[i]
+        ]
+        if non_mamba_tokens and not envs.VLLM_SPILL_NO_MAMBA:
+            attn_tokens = min(non_mamba_tokens)
+            use_eagle = any(getattr(m, "use_eagle", False) for m in managers)
+            if use_eagle:
+                # EAGLE reuses one block short of the matched boundary.
+                attn_tokens = max(0, attn_tokens - managers[0].block_size)
+            for mgr_idx, manager in enumerate(managers):
+                if type(getattr(manager, "kv_cache_spec", None)).__name__ != "MambaSpec":
+                    continue
+                try:
+                    rhs = resolve_block_hashes(
+                        request.block_hashes,
+                        self.block_pool.hash_block_size,
+                        manager.block_size,
+                    )
+                    max_idx = (
+                        min(len(rhs), attn_tokens // manager.block_size) - 1
+                    )
+                    state_blk = None
+                    for j in range(max_idx, -1, -1):
+                        found = self.block_pool.get_cached_block(rhs[j], [mgr_idx])
+                        if found:
+                            state_blk = found[0]
+                            break
+                except Exception:
+                    state_blk = None
+                if state_blk is None or state_blk.block_hash is None:
+                    continue
+                if any(b is state_blk for b in entries):
+                    continue
+                per_mgr[mgr_idx].append(state_blk)
+                entries.append(state_blk)
+                total_tokens += manager.block_size
+                if envs.RAMTRACE:
+                    try:
+                        with open(
+                            envs.RAMTRACE_LOG, "a"
+                        ) as _f:
+                            _f.write(
+                                f"mamba cap g{mgr_idx} idx={j} "
+                                f"blk={state_blk.block_id}\n"
+                            )
+                    except Exception:
+                        pass
+
+        # Durable Mamba anchors share the SAME protection as their chain: they
+        # are folded into this keep-alive entry so they are released together
+        # with the chain (only under admission pressure) and never become an
+        # independent, unbounded pin. Anchors are already pinned during the
+        # owner's run (MambaManager window); hand them over here and make them
+        # ref-idle-pinned (free without enqueue, exactly like the chain blocks
+        # become right after this, in ``_free_request_blocks``).
+        anchor_ids: set[int] = set()
+        for mgr_idx, manager in enumerate(managers):
+            take = getattr(manager, "take_durable_window", None)
+            if take is None:
+                continue
+            anchors = take(request.request_id)
+            if not anchors:
+                continue
+            block_size = manager.block_size
+            for blk in anchors:
+                # ref is 1 (allocated, never freed during the run); this drops
+                # it to 0 while pinned>0 keeps it out of the free queue.
+                self.block_pool.free_blocks([blk])
+                anchor_ids.add(id(blk))
+                if any(b is blk for b in entries):
+                    # The boundary state block captured above can itself be a
+                    # cadence anchor. It is already in the entry; drop only its
+                    # allocation ref (done above) to avoid a duplicate unpin.
+                    continue
+                entries.append(blk)
+                total_tokens += block_size
+                # Include the anchor in the per-group chain so it is stored and
+                # restored with the session; this keeps truncated/deep reverts
+                # hitting their mamba anchor after a host-tier restore.
+                per_mgr[mgr_idx].append(blk)
+
+        if not entries:
+            return 0
+
+        bh_set = set(request.block_hashes)
+        # Subsumption: if an existing keep-alive chain is a prefix of this new
+        # chain (same conversation resumed / re-sent, tail hash reappears), drop
+        # the old entry and replace it with the longer chain.
+        subsumed = [
+            entry for entry in self._auto_pin_entries if entry["tail"] in bh_set
+        ]
+        for entry in subsumed:
+            self._unpin_entry(entry)
+
+        tail = request.block_hashes[-1] if request.block_hashes else None
+        for block in entries:
+            # Anchors were already pinned during the owner's run; only chain
+            # blocks (and any other non-anchor blocks) need pinning here.
+            if id(block) in anchor_ids:
+                continue
+            self.block_pool.pin_block(block)
+        self._auto_pin_entries.append(
+            {
+                "tail": tail,
+                "req_id": request.request_id,
+                "blocks": entries,
+                "grp_blocks": per_mgr,
+                "tokens": total_tokens,
+                "num_blocks": len(entries),
+                "anchors": len(anchor_ids),
+                "parked_at": time.monotonic(),
+            }
+        )
+        return len(entries)
+
+    def _unpin_entry(self, entry: dict[str, Any]) -> None:
+        for block in entry["blocks"]:
+            self.block_pool.unpin_block(block)
+        try:
+            self._auto_pin_entries.remove(entry)
+        except ValueError:
+            pass
+
+    def num_pinned_entries(self) -> int:
+        return len(self._auto_pin_entries)
+
+    def num_pinned_tokens(self) -> int:
+        return sum(e["tokens"] for e in self._auto_pin_entries)
+
+    def num_pinned_blocks(self) -> int:
+        return sum(len(e["blocks"]) for e in self._auto_pin_entries)
+
+    def num_pinned_anchors(self) -> int:
+        return sum(e.get("anchors", 0) for e in self._auto_pin_entries)
+
+    def num_pinned_anchor_sessions(self) -> int:
+        return sum(1 for e in self._auto_pin_entries if e.get("anchors", 0) > 0)
+
+    def ram_capacity(self) -> int:
+        return self._ram_capacity
+
+    def ram_slots_used(self) -> int:
+        # Slots held by an in-flight restore are counted as used (they are not
+        # in the free list until the load completes).
+        return self._ram_capacity - self.ram_slots_free()
+
+    def num_ram_sessions(self) -> int:
+        return len(self._ram_sessions)
+
+    def release_pins_smallest(self, need_free_blocks: int) -> int:
+        """Release keep-alive entries (smallest first) until there are enough
+        free blocks, or no pinned entries remain.
+
+        Returns the number of entries released.
+        """
+        released = 0
+        while self._auto_pin_entries:
+            if self.block_pool.get_num_free_blocks() >= need_free_blocks:
+                break
+            smallest = min(self._auto_pin_entries, key=lambda e: e["tokens"])
+            self._unpin_entry(smallest)
+            released += 1
+        return released
+
+    # ------------------------------------------------------------------ #
+    # Host-tier session spill (RAM parking).                             #
+    # ------------------------------------------------------------------ #
+    def set_ram_capacity(self, capacity: int) -> None:
+        """Configure the host-tier slot capacity (0 disables the tier)."""
+        self._ram_capacity = capacity
+        self._ram_free = [(0, capacity)] if capacity > 0 else []
+        if envs.RAMTRACE:
+            try:
+                with open(
+                    envs.RAMTRACE_LOG, "a"
+                ) as _f:
+                    _f.write(f"ram capacity slots={capacity}\n")
+            except Exception:
+                pass
+
+    def matches_pinned_chain(self, block_hashes: list[bytes]) -> bool:
+        """True if a keep-alive pinned chain's tail is in this request's hashes."""
+        if not block_hashes:
+            return False
+        bh = set(block_hashes)
+        return any(
+            e["tail"] is not None and e["tail"] in bh for e in self._auto_pin_entries
+        )
+
+    def ram_slots_free(self) -> int:
+        return sum(length for _, length in self._ram_free)
+
+    def alloc_ram_slots(self, n: int) -> list[int] | None:
+        """Allocate n contiguous host slots; None if insufficient space."""
+        if n <= 0 or n > self.ram_slots_free():
+            return None
+        for i, (start, length) in enumerate(self._ram_free):
+            if length >= n:
+                slots = list(range(start, start + n))
+                if length == n:
+                    del self._ram_free[i]
+                else:
+                    self._ram_free[i] = (start + n, length - n)
+                return slots
+        return None
+
+    def free_ram_slots(self, slots: list[int]) -> None:
+        if not slots:
+            return
+        slots = sorted(slots)
+        self._ram_free.append((slots[0], len(slots)))
+        # coalesce adjacent ranges
+        self._ram_free.sort()
+        merged: list[tuple[int, int]] = []
+        for start, length in self._ram_free:
+            if merged and merged[-1][0] + merged[-1][1] == start:
+                s0, l0 = merged[-1]
+                merged[-1] = (s0, l0 + length)
+            else:
+                merged.append((start, length))
+        self._ram_free = merged
+
+    def take_spill_candidates(self, need_free_blocks: int) -> list[dict[str, Any]]:
+        """Move keep-alive entries into spill hold in host-tier eviction order.
+
+        Small sessions (< ``VLLM_HOSTTIER_EVICT_SMALL_TOKENS``) are chosen
+        first, then large ones; within each tier the oldest is chosen first.
+        Unlike ``release_pins_smallest`` this does NOT unpin/free: blocks stay
+        pinned until their host store completes (correctness-first ordering),
+        then are released by ``confirm_spill``. Returns the chosen entries.
+        """
+        chosen: list[dict[str, Any]] = []
+        while self._auto_pin_entries:
+            if self.block_pool.get_num_free_blocks() >= need_free_blocks:
+                break
+            victim = min(
+                self._auto_pin_entries,
+                key=lambda e: evict_sort_key(e["tokens"], e["parked_at"]),
+            )
+            req_id = victim["req_id"]
+            self._auto_pin_entries.remove(victim)
+            self._spill_hold[req_id] = victim
+            chosen.append(victim)
+        return chosen
+
+    def abort_spill(self, req_id: str) -> None:
+        """Store did not fit / failed: release the held entry back to the free
+        pool (blocks were already unpinned-eligible; unpin makes them idle)."""
+        entry = self._spill_hold.pop(req_id, None)
+        if entry is not None:
+            released = entry.get("released_ids", set())
+            for block in entry["blocks"]:
+                if id(block) in released:
+                    continue
+                self.block_pool.unpin_block(block)
+
+    def has_spill_hold(self, req_id: str) -> bool:
+        return req_id in self._spill_hold
+
+    def confirm_spill_ssd(self, req_id: str) -> dict[str, Any] | None:
+        """SSD-mode spill: free GPU blocks and return the chain metadata.
+
+        Unlike ``confirm_spill`` this does not park the session in RAM; the
+        caller writes the staging slots to disk and indexes them there.
+        """
+        entry = self._spill_hold.pop(req_id, None)
+        if entry is None:
+            return None
+        for block in entry["blocks"]:
+            self.block_pool.unpin_block(block)
+        grp_hashes: list[list[bytes]] = []
+        for grp_blocks in entry["grp_blocks"]:
+            grp_hashes.append([b.block_hash for b in grp_blocks if not b.is_null])
+        return {
+            "req_id": req_id,
+            "tail": entry["tail"],
+            "grp_hashes": grp_hashes,
+            "tokens": entry["tokens"],
+        }
+
+    def release_spill_blocks(
+        self, req_id: str, blocks: list[KVCacheBlock]
+    ) -> bool:
+        """Free one chunk of a held spill; True when the hold is fully freed.
+
+        Used by chunked SSD spills: GPU blocks are unpinned/freed as soon as
+        their chunk has been copied to staging, so admission pressure is
+        relieved progressively instead of waiting for the whole session.
+        """
+        entry = self._spill_hold.get(req_id)
+        if entry is None:
+            return True
+        for block in blocks:
+            self.block_pool.unpin_block(block)
+        entry.setdefault("released_ids", set()).update(id(b) for b in blocks)
+        entry["released"] = entry.get("released", 0) + len(blocks)
+        return entry["released"] >= len(entry["blocks"])
+
+    def spill_hold_done(self, req_id: str) -> dict[str, Any] | None:
+        """Pop a fully-released spill hold and return its chain metadata."""
+        entry = self._spill_hold.pop(req_id, None)
+        if entry is None:
+            return None
+        grp_hashes: list[list[bytes]] = []
+        for grp_blocks in entry["grp_blocks"]:
+            grp_hashes.append([b.block_hash for b in grp_blocks if not b.is_null])
+        return {
+            "req_id": req_id,
+            "tail": entry["tail"],
+            "grp_hashes": grp_hashes,
+            "tokens": entry["tokens"],
+        }
+
+    def hold_restored_blocks(
+        self,
+        per_group_hashes: list[list[bytes]],
+        per_group_blocks: list[list[KVCacheBlock]],
+    ) -> None:
+        """Adopt loaded GPU blocks into the prefix cache and pin them.
+
+        Chunked restores hold each chunk until the whole chain is loaded:
+        otherwise the idle blocks would be evicted by other requests before
+        the resumed request is scheduled.
+        """
+        for hashes, blocks in zip(per_group_hashes, per_group_blocks):
+            for h, b in zip(hashes, blocks):
+                self.block_pool._insert_block_hash(h, b, None)
+        for blocks in per_group_blocks:
+            for b in blocks:
+                self.block_pool.pin_block(b)
+        if envs.RAMTRACE:
+            try:
+                with open(
+                    envs.RAMTRACE_LOG, "a"
+                ) as _f:
+                    _f.write(
+                        "hold_restored n=%d grp_lens=%s hashes=%s\n"
+                        % (
+                            sum(len(g) for g in per_group_blocks),
+                            [len(g) for g in per_group_blocks],
+                            [[repr(h)[:24] for h in grp] for grp in per_group_hashes],
+                        )
+                    )
+            except Exception:
+                pass
+
+    def release_restored_hold(self, blocks: list[KVCacheBlock]) -> None:
+        """Drop a restored-chunk hold, making the blocks idle-cached again."""
+        for b in blocks:
+            self.block_pool.free_blocks([b])
+            self.block_pool.unpin_block(b)
+
+    def confirm_spill(self, req_id: str, slots: list[int] | None) -> None:
+        """Host store finished: unpin/free GPU blocks and park the session."""
+        entry = self._spill_hold.pop(req_id, None)
+        if entry is None:
+            return
+        for block in entry["blocks"]:
+            self.block_pool.unpin_block(block)
+        # Parked record keeps only immutable chain metadata (per-group hashes +
+        # counts) and the CPU slot ranges, so a later restore can rebuild the
+        # chain in fresh GPU blocks without depending on the recycled originals.
+        grp_hashes: list[list[bytes]] = []
+        for grp_blocks in entry["grp_blocks"]:
+            grp_hashes.append(
+                [b.block_hash for b in grp_blocks if not b.is_null]
+            )
+        self._ram_sessions[req_id] = {
+            "req_id": req_id,
+            "tail": entry["tail"],
+            "grp_hashes": grp_hashes,
+            "tokens": entry["tokens"],
+            "num_blocks": entry["num_blocks"],
+            "slots": slots or [],
+            "parked_at": time.monotonic(),
+        }
+        if envs.RAMTRACE:
+            try:
+                with open(envs.RAMTRACE_LOG, "a") as _f:
+                    _f.write(
+                        f"confirm_spill req={req_id} slots={len(slots or [])} "
+                        f"grp_lens={[len(g) for g in grp_hashes]} tokens={entry['tokens']}\n"
+                    )
+            except Exception:
+                pass
+
+    def unpark_session(self, req_id: str) -> dict[str, Any] | None:
+        return self._ram_sessions.pop(req_id, None)
+
+    def get_ram_sessions(self) -> dict[str, dict[str, Any]]:
+        return self._ram_sessions
+
+    def evict_ram_for(self, need: int, protect: str | None = None) -> int:
+        """Free host slots by dropping parked sessions in eviction order.
+
+        Small sessions go first, then large ones; within each tier the oldest
+        parked session is dropped first. ``protect`` (the session being
+        restored, i.e. X) is never dropped. Returns the number of sessions
+        dropped.
+        """
+        dropped = 0
+        while self.ram_slots_free() < need:
+            candidates = [
+                s
+                for rid, s in self._ram_sessions.items()
+                if rid != protect
+            ]
+            if not candidates:
+                break
+            victim = min(
+                candidates,
+                key=lambda s: evict_sort_key(s["tokens"], s["parked_at"]),
+            )
+            self._ram_sessions.pop(victim["req_id"], None)
+            self.free_ram_slots(victim["slots"])
+            dropped += 1
+            if envs.RAMTRACE:
+                try:
+                    with open(
+                        envs.RAMTRACE_LOG, "a"
+                    ) as _f:
+                        _f.write(
+                            f"ram evict dropped={victim['req_id']} "
+                            f"tokens={victim['tokens']} "
+                            f"slots={len(victim['slots'])} need={need}\n"
+                        )
+                except Exception:
+                    pass
+        return dropped
+
+    def find_ram_session(self, block_hashes: list[bytes]) -> dict[str, Any] | None:
+        """Parked session that this request resumes/extends.
+
+        Uses the same tail-hash signal as keep-alive subsumption: if a request
+        carries a parked session's tail hash, that session's chain is its
+        prefix. Falls back to a strict hash-prefix match.
+        """
+        if not block_hashes:
+            return None
+        bh_set = set(block_hashes)
+        best: dict[str, Any] | None = None
+        best_len = 0
+        for sess in self._ram_sessions.values():
+            n = max((len(h) for h in sess["grp_hashes"]), default=0)
+            if n <= best_len:
+                continue
+            hit = sess["tail"] is not None and sess["tail"] in bh_set
+            if not hit:
+                for hashes in sess["grp_hashes"]:
+                    if hashes and len(block_hashes) >= len(hashes) and list(
+                        block_hashes[: len(hashes)]
+                    ) == list(hashes):
+                        hit = True
+                        break
+            if hit:
+                best = sess
+                best_len = n
+        return best
+
+    def allocate_restore_blocks(
+        self, per_group_lens: list[int]
+    ) -> list[list[KVCacheBlock]]:
+        """Allocate fresh GPU blocks (one run per group) for a restore."""
+        total = sum(per_group_lens)
+        flat = self.block_pool.get_new_blocks(total)
+        out: list[list[KVCacheBlock]] = []
+        idx = 0
+        for n in per_group_lens:
+            out.append(flat[idx : idx + n])
+            idx += n
+        return out
+
+    def register_restored_blocks(
+        self,
+        per_group_hashes: list[list[bytes]],
+        per_group_blocks: list[list[KVCacheBlock]],
+    ) -> None:
+        """Make loaded GPU blocks adoptable by the prefix cache.
+
+        Blocks are attached to their original chain hashes and returned to the
+        idle cached pool, so a subsequent lookup of the resumed request finds
+        the whole prefix on GPU.
+        """
+        for hashes, blocks in zip(per_group_hashes, per_group_blocks):
+            for h, b in zip(hashes, blocks):
+                self.block_pool._insert_block_hash(h, b, None)
+        for blocks in per_group_blocks:
+            if blocks:
+                self.block_pool.free_blocks(blocks)
+        if envs.RAMTRACE:
+            try:
+                probe = []
+                for hashes in per_group_hashes:
+                    if hashes:
+                        probe = self.block_pool.get_cached_block([hashes[0]])
+                        break
+                nums = [
+                    [getattr(b, "block_hash_num_tokens", None) for b in blks]
+                    for blks in per_group_blocks
+                ]
+                with open(envs.RAMTRACE_LOG, "a") as _f:
+                    _f.write(
+                        f"register_restored n={sum(len(b) for b in per_group_blocks)} "
+                        f"grp_lens={[len(b) for b in per_group_blocks]} "
+                        f"nums={nums} probe_found={len(probe)}\n"
+                    )
+            except Exception:
+                pass
 
     def remove_skipped_blocks(
         self,

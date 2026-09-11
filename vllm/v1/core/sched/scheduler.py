@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -38,6 +39,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.kv_offload.base import BlockIDsLoadStoreSpec, GPULoadStoreSpec
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -53,7 +55,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -132,6 +134,33 @@ class Scheduler(SchedulerInterface):
         # Whether a preempted request's in-flight output must be dropped; see
         # KVConnectorBase_V1.requires_kv_delivery.
         self.requires_kv_delivery = False
+        # Host-tier spill in flight: external store job id -> parked req id.
+        self._spill_job_to_req: dict[int, str] = {}
+        # Host-tier slots held for an in-flight spill, keyed by req id.
+        self._spill_slots: dict[str, list[int]] = {}
+        # Host-tier restores in flight: req id -> restore info.
+        self._restore_jobs: dict[str, dict[str, Any]] = {}
+        self._restore_job_to_req: dict[int, str] = {}
+        self._restored_req_ids: set[str] = set()
+        # Host-tier counters for metrics (deltas reported in SchedulerStats).
+        self._host_tier_spills = 0
+        self._host_tier_restores = 0
+        self._host_tier_evictions = 0
+        self._host_tier_drops = 0
+        # Two-tier GPU/SSD host tier (VLLM_SSD_ROOT). When set, parked
+        # sessions live on disk; the CPU buffer is a transient staging pool.
+        self._ssd_store: Any | None = None
+        # Chunked spills in flight: req id -> spill state.
+        self._ssd_spills: dict[str, dict[str, Any]] = {}
+        self._ssd_chunk_slots = 0
+        self._ssd_store_job_to_req: dict[int, str] = {}
+        self._ssd_load_job_to_req: dict[int, str] = {}
+        self._host_tier_ssd_stores = 0
+        self._host_tier_ssd_restores = 0
+        self._host_tier_ssd_evictions = 0
+        self._host_tier_ssd_drops = 0
+        self._host_tier_ssd_write_bytes = 0
+        self._host_tier_ssd_read_bytes = 0
         kv_transfer_config = self.vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             assert not self.is_encoder_decoder, (
@@ -292,6 +321,63 @@ class Scheduler(SchedulerInterface):
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+            # Enable the host-tier spill allocator if the connector exposes one.
+            try:
+                if envs.VLLM_DISABLE_HOSTTIER:
+                    self.kv_cache_manager.set_ram_capacity(0)
+                else:
+                    _cap = self.connector.cpu_capacity()
+                    self.kv_cache_manager.set_ram_capacity(_cap)
+                    if _cap > 0:
+                        _cs = getattr(self.connector, "connector_scheduler", None)
+                        if _cs is not None:
+                            # Host-tier owns the CPU buffer: disable the
+                            # connector's native offload so its allocator does
+                            # not overwrite parked sessions.
+                            _cs.native_store_enabled = False
+            except AttributeError:
+                self.kv_cache_manager.set_ram_capacity(0)
+            if (
+                envs.VLLM_SSD_ROOT
+                and not envs.VLLM_DISABLE_HOSTTIER
+                and self.kv_cache_manager.ram_capacity() > 0
+            ):
+                try:
+                    self._init_ssd_store()
+                except Exception:
+                    logger.exception(
+                        "Failed to initialize the SSD host tier; continuing "
+                        "without it"
+                    )
+                    self._ssd_store = None
+            elif envs.VLLM_SSD_ONLY:
+                raise RuntimeError(
+                    "VLLM_SSD_ONLY=1 requires VLLM_SSD_ROOT and a CPU staging "
+                    "pool (connector cpu_bytes_to_use)"
+                )
+            try:
+                cfg_groups = self.kv_cache_manager.kv_cache_config.kv_cache_groups
+                for g, mgr in enumerate(
+                    self.kv_cache_manager.coordinator.single_type_managers
+                ):
+                    spec = getattr(mgr, "kv_cache_spec", None)
+                    grp = cfg_groups[g]
+                    names = list(grp.layer_names)
+                    self._ramtrace(
+                        f"kvgroup g{g} mgr={type(mgr).__name__} "
+                        f"block_size={getattr(mgr, 'block_size', None)} "
+                        f"use_eagle={getattr(mgr, 'use_eagle', None)} "
+                        f"spec={type(spec).__name__ if spec is not None else None} "
+                        f"nlayers={len(names)} names={names}"
+                    )
+                self._ramtrace(
+                    f"coord sizes scheduler_bs={getattr(self.kv_cache_manager.coordinator, 'scheduler_block_size', None)} "
+                    f"hash_bs={getattr(self.kv_cache_manager.block_pool, 'hash_block_size', None)} "
+                    f"partial={getattr(self.kv_cache_manager.coordinator, 'enable_partial_hash_hits', None)} "
+                    f"eagle_ids={getattr(self.kv_cache_manager.coordinator, 'eagle_group_ids', None)}"
+                )
+            except Exception:
+                pass
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -414,6 +500,24 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit
             else 0
         )
+        # Durable Mamba snapshot cadence (VLLM_MAMBA_CKPT_TOKENS, tokens; 0=off).
+        # Chunks must END exactly on each cadence boundary so the align state
+        # snapshot written there can be retained and serve later interior reuse;
+        # a chunk that runs past a cadence boundary mid-way produces no block
+        # ending on it.
+        ckpt_tokens = getattr(self, "_mamba_ckpt_tokens", None)
+        if ckpt_tokens is None:
+            ckpt_tokens = envs.VLLM_MAMBA_CKPT_TOKENS
+            self._mamba_ckpt_tokens = ckpt_tokens
+        next_ckpt = 0
+        if ckpt_tokens:
+            next_ckpt = (
+                start // ckpt_tokens * ckpt_tokens + ckpt_tokens
+                if start % ckpt_tokens != 0
+                else start + ckpt_tokens
+            )
+            if next_ckpt >= prefill_end:
+                next_ckpt = 0
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
@@ -425,6 +529,8 @@ class Scheduler(SchedulerInterface):
             tail_boundary
             if last_cache_position < tail_boundary < request.num_prompt_tokens
             else 0,
+            # Durable Mamba snapshot cadence boundary (see above).
+            next_ckpt,
             # Marconi shared-prefix junction, block-floored (a sub-block
             # junction's state is not separately cacheable): cache its state
             # so sibling requests sharing the prefix can reuse it.
@@ -741,10 +847,31 @@ class Scheduler(SchedulerInterface):
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
 
+                # Host-tier restore: if this fresh request resumes a parked
+                # session, load its chain back to GPU before scheduling. The
+                # request is skipped (re-queued) until the load completes, at
+                # which point the normal prefix lookup finds the restored
+                # blocks.
+                if self._maybe_begin_restore(request):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     did_prefix_cache_lookup = True
                     hit_diverged = False
+                    restored_now = request.request_id in self._restored_req_ids
+                    # A local hit backed by an intact keep-alive chain (or a
+                    # just-restored chain) carries valid state for every group,
+                    # so the connector's hybrid divergence reconciliation must
+                    # not discard it.
+                    trusted_local = (
+                        not restored_now
+                        and self.kv_cache_manager.matches_pinned_chain(
+                            request.block_hashes
+                        )
+                    ) or (restored_now and envs.VLLM_RESTORE_TRUST)
                     # Get locally-cached tokens.
                     if self.connector is not None:
                         # A KV connector transfers the missing suffix, which needs a
@@ -764,6 +891,13 @@ class Scheduler(SchedulerInterface):
                             # Marconi shared-prefix junction to pin; 0 if none.
                             request.shared_prefix_boundary,
                         ) = self.kv_cache_manager.get_computed_blocks(request)
+
+                    if request.request_id in self._restored_req_ids:
+                        self._restored_req_ids.discard(request.request_id)
+                        self._ramtrace(
+                            f"restored scheduled req={request.request_id} "
+                            f"local_hit={num_new_local_computed_tokens}"
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -810,7 +944,11 @@ class Scheduler(SchedulerInterface):
                         else:
                             num_external_computed_tokens = ext_tokens
 
-                        if hit_diverged and num_external_computed_tokens == 0:
+                        if (
+                            hit_diverged
+                            and num_external_computed_tokens == 0
+                            and not trusted_local
+                        ):
                             # No external tokens back the deeper local hit, so its
                             # resume boundary would have no valid Mamba state.
                             # Reconcile to the boundary every group agrees on.
@@ -970,6 +1108,36 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
+                # Keep-alive pressure relief: if this new request cannot fit in
+                # the free (non-pinned) pool, release the SMALLEST kept-alive
+                # sessions first so the request can still make progress.
+                if self.kv_cache_manager.num_pinned_entries() > 0:
+                    need_blocks = self._request_remaining_blocks(
+                        request,
+                        new_computed_blocks,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                    )
+                    if (
+                        self.kv_cache_manager.block_pool.get_num_free_blocks()
+                        < need_blocks
+                    ):
+                        self._ramtrace(
+                            f"relief req={request.request_id} "
+                            f"need={need_blocks} "
+                            f"free={self.kv_cache_manager.block_pool.get_num_free_blocks()} "
+                            f"pinned={self.kv_cache_manager.num_pinned_entries()}"
+                        )
+                        self._spill_keepalive_entries(need_blocks)
+
+                _nb = getattr(new_computed_blocks, "blocks", None)
+                self._ramtrace(
+                    f"sched req={request.request_id} n_new={num_new_tokens} "
+                    f"local={num_new_local_computed_tokens} "
+                    f"ext={num_external_computed_tokens} "
+                    f"look={effective_lookahead_tokens} async={load_kv_async} "
+                    f"nblocks={[len(b) for b in _nb] if _nb else None}"
+                )
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -1916,6 +2084,11 @@ class Scheduler(SchedulerInterface):
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
+                if request.num_nans_in_logits:
+                    self._ramtrace(
+                        f"NAN target req={req_id} "
+                        f"n={request.num_nans_in_logits}"
+                    )
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
@@ -2328,8 +2501,40 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        # Keep-alive hook. MUST run BEFORE freeing: only now does the request's
+        # per-group block table still exist, so pin_request_auto can snapshot &
+        # pin the full cached prefix chain. Blocks pinned this way are withdrawn
+        # from the eviction queue and survive later cross-session pressure (a
+        # resumed long conversation then keeps hitting its full prefix instead of
+        # falling back to a full re-prefill). Note this build invalidates a whole
+        # chain if even ~1-2 pages are reused, so we pin the WHOLE chain, not a
+        # head window.
+        if self._should_keep_alive(request):
+            self.kv_cache_manager.pin_request_auto(request)
         self._free_request_blocks(request)
         del self.requests[request.request_id]
+
+    def _should_keep_alive(self, request: Request) -> bool:
+        """Auto keep-alive heuristic: protect the whole cached chain of any
+        successfully finished request that is long enough.
+
+        Controlled by ``VLLM_PIN_MIN_TOKENS`` (default 0, i.e. disabled;
+        set to a positive token threshold to opt in).
+        """
+        min_tokens = getattr(self, "_pin_min_tokens", None)
+        if min_tokens is None:
+            min_tokens = envs.VLLM_PIN_MIN_TOKENS
+            self._pin_min_tokens = min_tokens
+        if min_tokens <= 0:
+            return False
+        if request.num_tokens < min_tokens:
+            return False
+        if request.status not in (
+            RequestStatus.FINISHED_STOPPED,
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+        ):
+            return False
+        return True
 
     @property
     def pause_state(self) -> PauseState:
@@ -2516,7 +2721,7 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
-        return SchedulerStats(
+        stats = SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
@@ -2528,7 +2733,47 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            host_tier_slots_total=self.kv_cache_manager.ram_capacity(),
+            host_tier_slots_used=self.kv_cache_manager.ram_slots_used(),
+            host_tier_sessions=self.kv_cache_manager.num_ram_sessions(),
+            host_tier_spills=self._host_tier_spills,
+            host_tier_restores=self._host_tier_restores,
+            host_tier_evictions=self._host_tier_evictions,
+            host_tier_drops=self._host_tier_drops,
+            keep_alive_entries=self.kv_cache_manager.num_pinned_entries(),
+            keep_alive_blocks=self.kv_cache_manager.num_pinned_blocks(),
+            keep_alive_tokens=self.kv_cache_manager.num_pinned_tokens(),
+            keep_alive_anchors=self.kv_cache_manager.num_pinned_anchors(),
+            keep_alive_anchor_sessions=(
+                self.kv_cache_manager.num_pinned_anchor_sessions()
+            ),
+            host_tier_ssd_sessions=(
+                self._ssd_store.num_sessions if self._ssd_store else 0
+            ),
+            host_tier_ssd_bytes_used=(
+                self._ssd_store.bytes_used if self._ssd_store else 0
+            ),
+            host_tier_ssd_quota_bytes=(
+                self._ssd_store.quota_bytes if self._ssd_store else 0
+            ),
+            host_tier_ssd_stores=self._host_tier_ssd_stores,
+            host_tier_ssd_restores=self._host_tier_ssd_restores,
+            host_tier_ssd_evictions=self._host_tier_ssd_evictions,
+            host_tier_ssd_drops=self._host_tier_ssd_drops,
+            host_tier_ssd_write_bytes=self._host_tier_ssd_write_bytes,
+            host_tier_ssd_read_bytes=self._host_tier_ssd_read_bytes,
         )
+        self._host_tier_spills = 0
+        self._host_tier_restores = 0
+        self._host_tier_evictions = 0
+        self._host_tier_drops = 0
+        self._host_tier_ssd_stores = 0
+        self._host_tier_ssd_restores = 0
+        self._host_tier_ssd_evictions = 0
+        self._host_tier_ssd_drops = 0
+        self._host_tier_ssd_write_bytes = 0
+        self._host_tier_ssd_read_bytes = 0
+        return stats
 
     def make_spec_decoding_stats(
         self,
@@ -2553,6 +2798,12 @@ class Scheduler(SchedulerInterface):
         logger.debug_once("[shutdown] Scheduler: start")
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
+        if self._ssd_store is not None:
+            try:
+                self._ssd_store.shutdown()
+            except Exception:
+                logger.warning("SSD host tier shutdown failed", exc_info=True)
+            self._ssd_store = None
         if self.connector is not None:
             self.connector.shutdown()
 
@@ -2611,16 +2862,40 @@ class Scheduler(SchedulerInterface):
 
         return self.connector.request_finished_all_groups(request, block_ids)
 
-    def _request_remaining_blocks(self, request: Request) -> int:
-        """Blocks `request` still needs to allocate to hold its full sequence."""
+    def _request_remaining_blocks(
+        self,
+        request: Request,
+        new_computed_blocks: Any | None = None,
+        num_local_computed_tokens: int | None = None,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        """Blocks `request` still needs to allocate to hold its full sequence.
+
+        When the caller has already resolved this request's prefix hit, the
+        same arguments as the admission gate are used so the pressure-relief
+        threshold matches the gate exactly (an empty-hit estimate can be a few
+        blocks short and leave the request stuck below the gate).
+        """
         full_num_tokens = min(request.num_tokens, self.max_model_len)
+        if new_computed_blocks is None:
+            blocks = self.kv_cache_manager.empty_kv_cache_blocks.blocks
+            local = request.num_computed_tokens
+            external = 0
+        else:
+            blocks = new_computed_blocks.blocks
+            local = (
+                request.num_computed_tokens
+                if num_local_computed_tokens is None
+                else num_local_computed_tokens
+            )
+            external = num_external_computed_tokens
         return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=full_num_tokens,
-            new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
+            new_computed_blocks=blocks,
             num_encoder_tokens=0,
-            total_computed_tokens=request.num_computed_tokens,
-            num_local_computed_tokens=request.num_computed_tokens,
+            total_computed_tokens=local + external,
+            num_local_computed_tokens=local,
             num_tokens_main_model=full_num_tokens,
             apply_admission_cap=True,
         )
@@ -2631,6 +2906,732 @@ class Scheduler(SchedulerInterface):
         return sum(
             self._request_remaining_blocks(req) for req in self._inflight_prefills
         )
+
+    # ------------------------------------------------------------------ #
+    # Host-tier spill (RAM parking) helpers.                             #
+    # ------------------------------------------------------------------ #
+    def _init_ssd_store(self) -> None:
+        """Create the two-tier SSD session store over the shared host region."""
+        from vllm.v1.core.host_tier_ssd import HostTierSSDStore
+
+        create_region = getattr(self.connector, "create_scheduler_kv_region", None)
+        region = create_region() if create_region is not None else None
+        if region is None:
+            raise RuntimeError("connector does not expose a shared host KV region")
+        engine_id = getattr(self.connector, "cpu_engine_id", lambda: "0")()
+        self._ssd_store = HostTierSSDStore(
+            root_dir=envs.VLLM_SSD_ROOT,
+            quota_bytes=envs.VLLM_SSD_QUOTA_BYTES,
+            kv_view=region.create_kv_memoryview(),
+            engine_id=engine_id,
+            read_threads=envs.VLLM_SSD_READ_THREADS,
+            write_threads=envs.VLLM_SSD_WRITE_THREADS,
+            max_mbps=float(envs.VLLM_SSD_MAX_MBPS),
+            clean_start=envs.VLLM_SSD_CLEAN_START,
+            region=region,
+        )
+        staging_slots = self.kv_cache_manager.ram_capacity()
+        chunk = int(envs.VLLM_SSD_CHUNK_SLOTS)
+        if chunk <= 0:
+            chunk = max(1, staging_slots // 2)
+        self._ssd_chunk_slots = min(max(1, chunk), max(1, staging_slots))
+        logger.info(
+            "HostTierSSD: staging_slots=%d chunk_slots=%d evict_small=%d "
+            "block_size=%d",
+            staging_slots,
+            self._ssd_chunk_slots,
+            envs.VLLM_HOSTTIER_EVICT_SMALL_TOKENS,
+            self.block_size,
+        )
+
+    def _spill_keepalive_entries(self, need_blocks: int,
+                                 protect: str | None = None) -> None:
+        """Under admission pressure, drop the smallest keep-alive sessions.
+
+        With an SSD store each dropped session is streamed to disk in chunks
+        (GPU blocks are freed chunk by chunk); otherwise the session is parked
+        in the CPU host region as before.
+        """
+        kvm = self.kv_cache_manager
+        entries = kvm.take_spill_candidates(need_blocks)
+        # Offload larger sessions first (frees the most GPU per store and gives
+        # the biggest sessions the best shot at host space); the selection
+        # itself is small-tier-first / oldest-first (see take_spill_candidates).
+        for entry in reversed(entries):
+            req_id = entry["req_id"]
+            if self.connector is None:
+                kvm.abort_spill(req_id)
+                continue
+            if self._ssd_store is not None:
+                self._begin_ssd_spill(entry)
+                continue
+            job = self._build_spill_store_job(entry)
+            if job is None:
+                kvm.abort_spill(req_id)
+                continue
+            src_spec, _ = job
+            n_slots = len(src_spec.block_ids)
+            slots = kvm.alloc_ram_slots(n_slots)
+            if slots is None:
+                self._host_tier_evictions += kvm.evict_ram_for(
+                    n_slots, protect=protect
+                )
+                slots = kvm.alloc_ram_slots(n_slots)
+            if slots is None:
+                kvm.abort_spill(req_id)
+                self._host_tier_drops += 1
+                continue
+            dst_spec = BlockIDsLoadStoreSpec(block_ids=slots)
+            try:
+                job_id = self.connector.add_external_store(src_spec, dst_spec)
+            except Exception:
+                # Roll back the host slots and release the held entry so a
+                # failed enqueue does not leak either.
+                kvm.free_ram_slots(slots)
+                kvm.abort_spill(req_id)
+                continue
+            self._spill_job_to_req[job_id] = req_id
+            self._spill_slots[req_id] = slots
+            self._ramtrace(
+                f"spill enqueued req={req_id} job={job_id} n_slots={n_slots} "
+                f"grp_sizes={src_spec.group_sizes}"
+            )
+
+    # ------------------------------------------------------------------ #
+    # Chunked SSD spill/restore (no session-size limit).                 #
+    # ------------------------------------------------------------------ #
+    def _begin_ssd_spill(self, entry: dict[str, Any]) -> None:
+        """Reserve quota for a session and start streaming it to disk."""
+        kvm = self.kv_cache_manager
+        req_id = entry["req_id"]
+        n_groups = len(entry["grp_blocks"])
+        # Transfer attention groups first and Mamba anchors last: freed blocks
+        # are evicted from the head of the free queue, so writing the anchors
+        # last keeps the reusable recurrent states resident longest.
+        order = self._ssd_transfer_order(n_groups)
+        flat: list[KVCacheBlock] = []
+        spans: dict[int, tuple[int, int]] = {}
+        for g in order:
+            start = len(flat)
+            for block in entry["grp_blocks"][g]:
+                if not block.is_null:
+                    flat.append(block)
+            spans[g] = (start, len(flat))
+        if not flat:
+            kvm.abort_spill(req_id)
+            self._host_tier_drops += 1
+            self._host_tier_ssd_drops += 1
+            return
+        grp_hashes = [
+            [b.block_hash for b in grp if not b.is_null]
+            for grp in entry["grp_blocks"]
+        ]
+        nbytes = len(flat) * self._ssd_store.row_bytes
+        evicted = self._ssd_store.evict_for(nbytes)
+        if evicted:
+            self._host_tier_evictions += evicted
+            self._host_tier_ssd_evictions += evicted
+        if not self._ssd_store.begin_store(
+            req_id, len(flat), grp_hashes, entry["tail"], entry["tokens"]
+        ):
+            kvm.abort_spill(req_id)
+            self._host_tier_drops += 1
+            self._host_tier_ssd_drops += 1
+            return
+        self._ssd_spills[req_id] = {
+            "flat": flat,
+            "spans": spans,
+            "total": len(flat),
+            "cursor": 0,
+            "staging": [],
+            "chunk": [],
+            "chunk_start": 0,
+            "phase": "idle",
+            "job_id": None,
+        }
+        self._ramtrace(
+            f"ssd spill begin req={req_id} n_slots={len(flat)} nbytes={nbytes}"
+        )
+        self._ramtrace(
+            "ssd spill hashes req=%s %s"
+            % (
+                req_id,
+                [
+                    [repr(h)[:24] for h in grp]
+                    for grp in grp_hashes
+                ],
+            )
+        )
+        self._advance_ssd_spill(req_id)
+
+    def _ssd_transfer_order(self, n_groups: int) -> list[int]:
+        """Group indices ordered for SSD transfer: attention first, Mamba last."""
+        specs = getattr(self.kv_cache_config, "kv_cache_groups", [])
+        attn: list[int] = []
+        mamba: list[int] = []
+        for g in range(n_groups):
+            spec = specs[g].kv_cache_spec if g < len(specs) else None
+            if spec is not None and isinstance(spec, MambaSpec):
+                mamba.append(g)
+            else:
+                attn.append(g)
+        return attn + mamba
+
+    def _build_chunk_gpu_spec(
+        self, state: dict[str, Any], start: int, n: int
+    ) -> GPULoadStoreSpec:
+        """GPU spec for one chunk; group_sizes covers every KV group."""
+        end = start + n
+        group_sizes: list[int] = []
+        block_ids: list[int] = []
+        for g in range(len(state["spans"])):
+            g_start, g_end = state["spans"][g]
+            lo = max(start, g_start)
+            hi = min(end, g_end)
+            count = max(0, hi - lo)
+            group_sizes.append(count)
+            if count:
+                block_ids.extend(b.block_id for b in state["flat"][lo:hi])
+        return GPULoadStoreSpec(
+            block_ids=block_ids,
+            group_sizes=group_sizes,
+            block_indices=[0] * len(group_sizes),
+        )
+
+    def _advance_ssd_spill(self, req_id: str) -> None:
+        """Start the next chunk's GPU->CPU copy if staging is available."""
+        state = self._ssd_spills.get(req_id)
+        if state is None or state["phase"] != "idle":
+            return
+        remaining = state["total"] - state["cursor"]
+        if remaining <= 0:
+            return
+        chunk_n = min(self._ssd_chunk_slots, remaining)
+        slots = self.kv_cache_manager.alloc_ram_slots(chunk_n)
+        if slots is None:
+            # Staging is busy with other transfers; retry on a later step.
+            # The session's GPU blocks stay pinned in the spill hold.
+            return
+        start = state["cursor"]
+        src_spec = self._build_chunk_gpu_spec(state, start, chunk_n)
+        dst_spec = BlockIDsLoadStoreSpec(block_ids=slots)
+        try:
+            job_id = self.connector.add_external_store(src_spec, dst_spec)
+        except Exception:
+            self.kv_cache_manager.free_ram_slots(slots)
+            self._abort_ssd_spill(req_id, count_drop=True)
+            return
+        state.update(
+            staging=slots,
+            chunk=state["flat"][start:start + chunk_n],
+            chunk_start=start,
+            phase="copy",
+            job_id=job_id,
+        )
+        self._spill_job_to_req[job_id] = req_id
+
+    def _abort_ssd_spill(self, req_id: str, count_drop: bool = False) -> None:
+        """Drop a partial spill and release its GPU/staging resources."""
+        state = self._ssd_spills.pop(req_id, None)
+        kvm = self.kv_cache_manager
+        if state is not None and state["staging"]:
+            kvm.free_ram_slots(state["staging"])
+        self._ssd_store.abort_store(req_id)
+        kvm.abort_spill(req_id)
+        if count_drop:
+            self._host_tier_drops += 1
+            self._host_tier_ssd_drops += 1
+
+    def _chunk_group_counts(
+        self, spans: dict[int, tuple[int, int]], start: int, n: int
+    ) -> list[int]:
+        end = start + n
+        counts = [0] * len(spans)
+        for g, (g_start, g_end) in spans.items():
+            counts[g] = max(0, min(end, g_end) - max(start, g_start))
+        return counts
+
+    def _chunk_group_hashes(
+        self,
+        spans: dict[int, tuple[int, int]],
+        flat_hashes: list[bytes],
+        start: int,
+        n: int,
+    ) -> list[list[bytes]]:
+        end = start + n
+        out: list[list[bytes]] = [[] for _ in range(len(spans))]
+        for g, (g_start, g_end) in spans.items():
+            out[g] = list(flat_hashes[max(start, g_start):min(end, g_end)])
+        return out
+
+    def _advance_ssd_restore(self, req_id: str) -> None:
+        """Start the next chunk's SSD->staging read if there is GPU room."""
+        info = self._restore_jobs.get(req_id)
+        if info is None or info.get("stage") != "ssd" or info.get("phase") != "idle":
+            return
+        if req_id not in self.requests:
+            self._fail_ssd_restore(req_id)
+            return
+        remaining = info["total"] - info["cursor"]
+        if remaining <= 0:
+            return
+        chunk_n = min(self._ssd_chunk_slots, remaining)
+        kvm = self.kv_cache_manager
+        if kvm.block_pool.get_num_free_blocks() < chunk_n:
+            # Free GPU room first (spill the smallest keep-alive sessions);
+            # the restore target is protected from host-tier eviction.
+            if kvm.num_pinned_entries() > 0:
+                self._spill_keepalive_entries(
+                    chunk_n, protect=info["session"]["req_id"]
+                )
+            return
+        slots = kvm.alloc_ram_slots(chunk_n)
+        if slots is None:
+            # Staging is busy; retry on a later step (restore has priority:
+            # spills only take staging left over by this path).
+            return
+        # Allocate the chunk's GPU blocks now, while the free-block check above
+        # still holds; another request could otherwise take them while the SSD
+        # read is in flight.
+        chunk_lens = self._chunk_group_counts(
+            info["spans"], info["cursor"], chunk_n
+        )
+        chunk_hashes = self._chunk_group_hashes(
+            info["spans"], info["flat_hashes"], info["cursor"], chunk_n
+        )
+        per_group_blocks = kvm.allocate_restore_blocks(chunk_lens)
+        job_id = self._ssd_store.submit_load_range(
+            info["session"]["sid"], info["cursor"], slots, keep_files=True
+        )
+        if job_id is None:
+            kvm.free_ram_slots(slots)
+            kvm.block_pool.free_blocks(
+                [b for grp in per_group_blocks for b in grp]
+            )
+            self._fail_ssd_restore(req_id)
+            return
+        info.update(
+            staging=slots,
+            phase="read",
+            job_id=job_id,
+            chunk_lens=chunk_lens,
+            chunk_hashes=chunk_hashes,
+            chunk_blocks=per_group_blocks,
+        )
+        self._ssd_load_job_to_req[job_id] = req_id
+
+    def _complete_ssd_restore(self, req_id: str) -> None:
+        info = self._restore_jobs.pop(req_id, None)
+        if info is None:
+            return
+        self.kv_cache_manager.release_restored_hold(info.get("held_blocks", []))
+        self._ssd_store.finish_restore(info["session"]["sid"])
+        if req_id in self.requests:
+            self._restored_req_ids.add(req_id)
+        self._host_tier_restores += 1
+        self._host_tier_ssd_restores += 1
+        self._ramtrace(f"restore done req={req_id} (chunked)")
+
+    def _fail_ssd_restore(self, req_id: str) -> None:
+        info = self._restore_jobs.pop(req_id, None)
+        if info is None:
+            return
+        kvm = self.kv_cache_manager
+        if info.get("staging"):
+            kvm.free_ram_slots(info["staging"])
+        pending = [
+            b for grp in (info.get("chunk_blocks") or []) for b in grp
+        ]
+        if pending:
+            # Allocated for the in-flight chunk but never adopted into the
+            # prefix cache; give them back to the free pool.
+            kvm.block_pool.free_blocks(pending)
+        if info.get("held_blocks"):
+            kvm.release_restored_hold(info["held_blocks"])
+        self._ssd_store.discard(info["session"]["sid"])
+        self._host_tier_drops += 1
+        self._host_tier_ssd_drops += 1
+        self._ramtrace(f"restore failed req={req_id} sid={info['session']['sid']}")
+
+
+    def _build_spill_store_job(self, entry) -> tuple[Any, Any] | None:
+        """Build one GPU->CPU store job spanning every group's chain blocks.
+
+        Slots are allocated per group (contiguous) from a single allocator
+        range; the caller replaces the returned dst with actual slots.
+        """
+        groups_info = []
+        for gidx, grp_blocks in enumerate(entry["grp_blocks"]):
+            n_null = sum(1 for b in grp_blocks if b.is_null)
+            n_hash = sum(1 for b in grp_blocks if b.block_hash is not None)
+            groups_info.append(
+                f"g{gidx}:n={len(grp_blocks)},null={n_null},hash={n_hash}"
+            )
+        self._ramtrace("spill groups " + " ".join(groups_info))
+        group_sizes: list[int] = []
+        block_indices: list[int] = []
+        block_ids: list[int] = []
+        offset = 0
+        for grp_blocks in entry["grp_blocks"]:
+            ids = [b.block_id for b in grp_blocks if not b.is_null]
+            group_sizes.append(len(ids))
+            # blocks_per_chunk is 1 for the host tier: no partial-chunk
+            # alignment, so the logical offset is never consulted.
+            block_indices.append(0)
+            block_ids.extend(ids)
+            offset += len(ids)
+        if not block_ids:
+            return None
+        src_spec = GPULoadStoreSpec(
+            block_ids=block_ids,
+            group_sizes=group_sizes,
+            block_indices=block_indices,
+        )
+        dst_spec = BlockIDsLoadStoreSpec(block_ids=list(range(offset)))
+        return src_spec, dst_spec
+
+    def _drain_ssd_jobs(self) -> None:
+        """Advance chunked SSD store/load jobs and reap completed ones."""
+        assert self._ssd_store is not None
+        kvm = self.kv_cache_manager
+        # Aborted restores whose next chunk is not in flight: release now
+        # instead of reading the rest of the session for nothing.
+        for rid in list(self._restore_jobs):
+            info = self._restore_jobs[rid]
+            if (
+                info.get("stage") == "ssd"
+                and info.get("phase") == "idle"
+                and rid not in self.requests
+            ):
+                self._fail_ssd_restore(rid)
+        # Restores get first claim on staging; spills use what is left over.
+        for rid in list(self._restore_jobs):
+            info = self._restore_jobs.get(rid)
+            if (
+                info is not None
+                and info.get("stage") == "ssd"
+                and info.get("phase") == "idle"
+            ):
+                self._advance_ssd_restore(rid)
+        # Pump spills that are waiting for staging (e.g. after another chunk
+        # completed) so a stalled pipeline always makes progress.
+        for rid in list(self._ssd_spills):
+            state = self._ssd_spills.get(rid)
+            if state is not None and state["phase"] == "idle":
+                self._advance_ssd_spill(rid)
+        for res in self._ssd_store.poll():
+            if res.kind == "store":
+                req_id = self._ssd_store_job_to_req.pop(res.job_id, None)
+                state = self._ssd_spills.get(req_id) if req_id else None
+                if state is None:
+                    # Orphaned append from an aborted spill.
+                    continue
+                kvm.free_ram_slots(state["staging"])
+                state["staging"] = []
+                if not res.success:
+                    self._abort_ssd_spill(req_id, count_drop=True)
+                    continue
+                self._host_tier_ssd_write_bytes += res.nbytes
+                if res.commit:
+                    kvm.spill_hold_done(req_id)
+                    self._ssd_spills.pop(req_id, None)
+                    self._host_tier_spills += 1
+                    self._host_tier_ssd_stores += 1
+                    self._ramtrace(
+                        f"ssd store done req={req_id} n_slots={state['total']}"
+                    )
+                else:
+                    state["cursor"] += len(state["chunk"])
+                    state["chunk"] = []
+                    state["phase"] = "idle"
+                    state["job_id"] = None
+                    self._advance_ssd_spill(req_id)
+                continue
+            # Load-range completion: stage the chunk on GPU.
+            req_id = self._ssd_load_job_to_req.pop(res.job_id, None)
+            info = self._restore_jobs.get(req_id) if req_id else None
+            if info is None or info.get("stage") != "ssd":
+                kvm.free_ram_slots(res.slots)
+                continue
+            if not res.success:
+                kvm.free_ram_slots(res.slots)
+                info["staging"] = []
+                self._fail_ssd_restore(req_id)
+                continue
+            if req_id not in self.requests:
+                # Aborted while the read was in flight.
+                kvm.free_ram_slots(res.slots)
+                info["staging"] = []
+                self._fail_ssd_restore(req_id)
+                continue
+            self._host_tier_ssd_read_bytes += res.nbytes
+            start = info["cursor"]
+            n = len(res.slots)
+            chunk_hashes = info["chunk_hashes"]
+            per_group_blocks = info["chunk_blocks"]
+            block_ids: list[int] = []
+            group_sizes: list[int] = []
+            for hashes, blocks in zip(chunk_hashes, per_group_blocks):
+                group_sizes.append(len(hashes))
+                block_ids.extend(b.block_id for b in blocks)
+            dst_spec = GPULoadStoreSpec(
+                block_ids=block_ids,
+                group_sizes=group_sizes,
+                block_indices=[0] * len(group_sizes),
+            )
+            src_spec = BlockIDsLoadStoreSpec(block_ids=list(res.slots))
+            job_id = self.connector.add_external_load(src_spec, dst_spec)
+            info.update(
+                phase="gpu_load",
+                job_id=job_id,
+                chunk_blocks=per_group_blocks,
+                chunk_hashes=chunk_hashes,
+            )
+            self._restore_job_to_req[job_id] = req_id
+            self._ramtrace(
+                f"ssd load chunk done -> gpu load req={req_id} "
+                f"start={start} n={n} job={job_id}"
+            )
+
+    def _drain_spill_completions(self) -> None:
+        """Resolve completed host-tier transfers (spill stores / restore loads)."""
+        if self.connector is None:
+            return
+        if self._ssd_store is not None:
+            self._drain_ssd_jobs()
+        if not self._spill_job_to_req and not self._restore_job_to_req:
+            return
+        done = self.connector.take_external_completed()
+        for job_id in done:
+            req_id = self._spill_job_to_req.pop(job_id, None)
+            if req_id is not None:
+                if self._ssd_store is not None:
+                    self._finish_ssd_copy(req_id)
+                    continue
+                slots = self._spill_slots.pop(req_id, None)
+                # GPU blocks are unpinned/freed by the manager; the parked
+                # record (CPU slots + chain metadata) enables a later restore.
+                self.kv_cache_manager.confirm_spill(req_id, slots)
+                self._host_tier_spills += 1
+                self._ramtrace(f"spill done req={req_id} job={job_id}")
+                continue
+            req_id = self._restore_job_to_req.pop(job_id, None)
+            if req_id is not None:
+                info = self._restore_jobs.get(req_id)
+                if info is not None and info.get("stage") == "ssd":
+                    self._finish_ssd_chunk(req_id, info)
+                    continue
+                info = self._restore_jobs.pop(req_id, None)
+                if info is not None:
+                    self.kv_cache_manager.register_restored_blocks(
+                        info["per_group_hashes"], info["per_group_blocks"]
+                    )
+                    # The load is done; the source host slots can now be reused.
+                    self.kv_cache_manager.free_ram_slots(info.get("slots", []))
+                    # If the request was aborted while the load was in flight it
+                    # will never be scheduled, so do not leave a stale id behind
+                    # (register_restored_blocks above is still valid: the blocks
+                    # are useful cached KV).
+                    if req_id in self.requests:
+                        self._restored_req_ids.add(req_id)
+                    self._host_tier_restores += 1
+                    if info.get("ssd"):
+                        self._host_tier_ssd_restores += 1
+                    self._ramtrace(f"restore done req={req_id} job={job_id}")
+
+    def _finish_ssd_copy(self, req_id: str) -> None:
+        """GPU->CPU copy of one spill chunk finished: write it to disk."""
+        state = self._ssd_spills.get(req_id)
+        if state is None or state["phase"] != "copy":
+            return
+        done = self.kv_cache_manager.release_spill_blocks(req_id, state["chunk"])
+        job_id = self._ssd_store.append_store(
+            req_id, state["chunk_start"], state["staging"], commit=done
+        )
+        if job_id is None:
+            self.kv_cache_manager.free_ram_slots(state["staging"])
+            state["staging"] = []
+            self._abort_ssd_spill(req_id, count_drop=True)
+            return
+        state["phase"] = "write"
+        state["job_id"] = job_id
+        self._ssd_store_job_to_req[job_id] = req_id
+        self._ramtrace(
+            f"ssd spill chunk copied req={req_id} start={state['chunk_start']} "
+            f"n={len(state['chunk'])} commit={done}"
+        )
+
+    def _finish_ssd_chunk(
+        self, req_id: str, info: dict[str, Any]
+    ) -> None:
+        """GPU load of one restore chunk finished: hold it and continue."""
+        kvm = self.kv_cache_manager
+        if info.get("phase") != "gpu_load":
+            return
+        kvm.hold_restored_blocks(info["chunk_hashes"], info["chunk_blocks"])
+        for blocks in info["chunk_blocks"]:
+            info["held_blocks"].extend(blocks)
+        n = len(info["staging"])
+        kvm.free_ram_slots(info["staging"])
+        info["staging"] = []
+        if req_id not in self.requests:
+            # Aborted while this chunk was loading: keep the data as cached KV
+            # and drop the rest of the restore.
+            info.update(chunk_blocks=[], chunk_hashes=[], phase="idle", job_id=None)
+            self._fail_ssd_restore(req_id)
+            return
+        info["cursor"] += n
+        info.update(
+            staging=[],
+            chunk_blocks=[],
+            chunk_hashes=[],
+            phase="idle",
+            job_id=None,
+        )
+        if info["cursor"] >= info["total"]:
+            self._complete_ssd_restore(req_id)
+        else:
+            self._ramtrace(
+                f"ssd restore chunk done req={req_id} "
+                f"cursor={info['cursor']}/{info['total']}"
+            )
+            self._advance_ssd_restore(req_id)
+
+    def _maybe_begin_restore(self, request: Request) -> bool:
+        """Try to restore a parked session backing this fresh request.
+
+        Returns True when the request must be re-queued (restore in progress,
+        or GPU room is being freed first); False to schedule normally.
+        """
+        kvm = self.kv_cache_manager
+        if self.connector is None or request.num_computed_tokens != 0:
+            return False
+        if request.request_id in self._restore_jobs:
+            return True
+        if not kvm.get_ram_sessions() and self._ssd_store is None:
+            return False
+        sess = kvm.find_ram_session(request.block_hashes)
+        ssd_mode = False
+        if sess is None and self._ssd_store is not None:
+            sess = self._ssd_store.find(request.block_hashes)
+            ssd_mode = sess is not None
+        if sess is None:
+            self._ramtrace(
+                f"restore probe req={request.request_id} "
+                f"nsess={len(kvm.get_ram_sessions())} "
+                f"nssd={self._ssd_store.num_sessions if self._ssd_store else 0} "
+                f"match=None"
+            )
+            return False
+        lens = [len(h) for h in sess["grp_hashes"]]
+        self._ramtrace(
+            f"restore begin req={request.request_id} sess={sess['req_id']} "
+            f"ssd={ssd_mode} grp_lens={lens} tail={sess['tail']} "
+            f"first_hashes={[ (h[:1] if h else []) for h in sess['grp_hashes'] ]}"
+        )
+        need = sum(lens)
+        if need == 0:
+            if ssd_mode:
+                self._ssd_store.remove(sess["sid"])
+            else:
+                kvm.unpark_session(sess["req_id"])
+                kvm.free_ram_slots(sess["slots"])
+            return False
+        if ssd_mode:
+            taken = self._ssd_store.take_for_restore(sess["sid"])
+            if taken is None:
+                return False
+            flat_hashes: list[bytes] = []
+            spans: dict[int, tuple[int, int]] = {}
+            for g in self._ssd_transfer_order(len(sess["grp_hashes"])):
+                start = len(flat_hashes)
+                flat_hashes.extend(sess["grp_hashes"][g])
+                spans[g] = (start, len(flat_hashes))
+            self._restore_jobs[request.request_id] = {
+                "stage": "ssd",
+                "session": taken,
+                "per_group_lens": lens,
+                "per_group_hashes": [list(h) for h in sess["grp_hashes"]],
+                "flat_hashes": flat_hashes,
+                "spans": spans,
+                "total": need,
+                "cursor": 0,
+                "staging": [],
+                "phase": "idle",
+                "job_id": None,
+                "held_blocks": [],
+                "ssd": True,
+            }
+            self._ramtrace(
+                "restore hashes req=%s %s"
+                % (
+                    request.request_id,
+                    [
+                        [repr(h)[:24] for h in grp]
+                        for grp in sess["grp_hashes"]
+                    ],
+                )
+            )
+            self._ramtrace(
+                f"restore enqueued (ssd) req={request.request_id} "
+                f"sid={sess['sid']} n_slots={need} chunked"
+            )
+            self._advance_ssd_restore(request.request_id)
+            return True
+        if kvm.block_pool.get_num_free_blocks() < need:
+            # Free GPU room first (spill the smallest keep-alive sessions);
+            # the request retries on a later step. The parked target X is
+            # protected from host-tier eviction.
+            if kvm.num_pinned_entries() > 0:
+                self._spill_keepalive_entries(need, protect=sess["req_id"])
+            return True
+        per_group_blocks = kvm.allocate_restore_blocks(lens)
+        self._ramtrace(
+            f"restore blocks req={request.request_id} "
+            f"ids={[[b.block_id for b in g] for g in per_group_blocks]}"
+        )
+        slots = sess["slots"]
+        block_ids: list[int] = []
+        group_sizes: list[int] = []
+        block_indices: list[int] = []
+        for h, blocks in zip(sess["grp_hashes"], per_group_blocks):
+            group_sizes.append(len(h))
+            block_indices.append(0)
+            block_ids.extend(b.block_id for b in blocks)
+        dst_spec = GPULoadStoreSpec(
+            block_ids=block_ids,
+            group_sizes=group_sizes,
+            block_indices=block_indices,
+        )
+        src_spec = BlockIDsLoadStoreSpec(block_ids=list(slots))
+        job_id = self.connector.add_external_load(src_spec, dst_spec)
+        self._restore_jobs[request.request_id] = {
+            "job_id": job_id,
+            "session": sess,
+            "per_group_blocks": per_group_blocks,
+            "per_group_hashes": [list(h) for h in sess["grp_hashes"]],
+            # Hold the source host slots until the load completes: stores and
+            # loads run on independent transfer handlers, so releasing them here
+            # would let a concurrent spill overwrite the slots mid-copy.
+            "slots": list(slots),
+        }
+        self._restore_job_to_req[job_id] = request.request_id
+        kvm.unpark_session(sess["req_id"])
+        self._ramtrace(
+            f"restore enqueued req={request.request_id} job={job_id} "
+            f"n_slots={len(slots)} grp_sizes={group_sizes}"
+        )
+        return True
+
+    def _ramtrace(self, msg: str) -> None:
+        if envs.RAMTRACE:
+            try:
+                with open(
+                    envs.RAMTRACE_LOG, "a"
+                ) as _f:
+                    _f.write(f"{msg}\n")
+            except Exception:
+                pass
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """
@@ -2724,6 +3725,7 @@ class Scheduler(SchedulerInterface):
 
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
+            self._drain_spill_completions()
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():

@@ -146,6 +146,23 @@ class CPUOffloadingSpec(OffloadingSpec):
         per-rank tensor); replicated-layout dedup is gated on this being True."""
         return current_platform.is_cuda_alike()
 
+    def create_scheduler_view(self) -> SharedOffloadRegion | None:
+        """Create a scheduler-side zero-copy view of the shared host region.
+
+        Used by the host-tier SSD store to read/write staging slots directly
+        from the scheduler process. Returns None when the platform does not
+        use a shared region or no CPU blocks were configured.
+        """
+        if not self._uses_shared_region() or self.num_blocks <= 0:
+            return None
+        return SharedOffloadRegion(
+            engine_id=self.config.engine_id,
+            num_blocks=self.num_blocks,
+            rank=None,
+            kv_bytes_per_block=self.kv_bytes_per_chunk,
+            cpu_page_size=self.cpu_page_size_per_worker,
+        )
+
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
         mmap_region: SharedOffloadRegion | None = None
         # num_blocks == 0 would size the region to zero bytes, which cannot be

@@ -231,6 +231,39 @@ if TYPE_CHECKING:
     VLLM_KV_CACHE_LAYOUT: Literal["NHD", "HND"] | None = None
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
+    # Auto keep-alive of long finished conversations (tokens; 0 = disabled).
+    VLLM_PIN_MIN_TOKENS: int = 0
+    # Durable Mamba snapshot cadence in tokens (0 = disabled).
+    VLLM_MAMBA_CKPT_TOKENS: int = 0
+    # Max durable Mamba anchors retained per request (clamped to >= 1 in code).
+    VLLM_MAMBA_CKPT_ANCHORS: int = 3
+    # Kill switch for the self-built host-tier spill/restore allocator.
+    # Host-tier is enabled by a connector with capacity; this only forces it off.
+    VLLM_DISABLE_HOSTTIER: bool = False
+    # Two-tier GPU/SSD host tier: park sessions to a filesystem directory.
+    # Empty = disabled (RAM parking fallback). Quota is enforced with LRU.
+    VLLM_SSD_ROOT: str = ""
+    VLLM_SSD_QUOTA_BYTES: int = 8 * (1 << 30)  # 8 GiB
+    VLLM_SSD_READ_THREADS: int = 8
+    VLLM_SSD_WRITE_THREADS: int = 8
+    # Aggregate write/read rate cap in MB/s (0 = unlimited).
+    VLLM_SSD_MAX_MBPS: int = 0
+    # Wipe this engine's session directory at startup.
+    VLLM_SSD_CLEAN_START: bool = True
+    # Blocks per SSD transfer chunk (0 = half the staging pool, double buffer).
+    VLLM_SSD_CHUNK_SLOTS: int = 0
+    # Require VLLM_SSD_ROOT: refuse to fall back to CPU parking when unset.
+    VLLM_SSD_ONLY: bool = False
+    # Host-tier eviction: sessions below this many tokens are evicted before
+    # larger ones; within each tier the oldest is evicted first. 0 = one tier.
+    VLLM_HOSTTIER_EVICT_SMALL_TOKENS: int = 64000
+    # Diagnostic: skip Mamba boundary-state capture when spilling.
+    VLLM_SPILL_NO_MAMBA: bool = False
+    # Diagnostic: trust a just-restored chain without connector reconciliation.
+    VLLM_RESTORE_TRUST: bool = False
+    # Diagnostic: append host-tier spill/restore traces to a log file.
+    RAMTRACE: bool = False
+    RAMTRACE_LOG: str = "/tmp/vllm_ramtrace.log"
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
         "FP", "INT8", "INT6", "INT4", "INT3", "NONE"
     ] = "NONE"
@@ -1743,6 +1776,48 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_COMPUTE_NANS_IN_LOGITS": lambda: bool(
         int(os.getenv("VLLM_COMPUTE_NANS_IN_LOGITS", "0"))
     ),
+    # Auto keep-alive of long finished conversations (tokens; 0 = disabled).
+    "VLLM_PIN_MIN_TOKENS": lambda: int(os.getenv("VLLM_PIN_MIN_TOKENS", "0")),
+    # Durable Mamba snapshot cadence in tokens (0 = disabled).
+    "VLLM_MAMBA_CKPT_TOKENS": lambda: int(
+        os.getenv("VLLM_MAMBA_CKPT_TOKENS", "0")
+    ),
+    # Max durable Mamba anchors retained per request (clamped to >= 1 in code).
+    "VLLM_MAMBA_CKPT_ANCHORS": lambda: int(
+        os.getenv("VLLM_MAMBA_CKPT_ANCHORS", "3")
+    ),
+    # Kill switch for the self-built host-tier spill/restore allocator.
+    # Host-tier is enabled by a connector with capacity; this only forces it off.
+    "VLLM_DISABLE_HOSTTIER": lambda: bool(
+        int(os.getenv("VLLM_DISABLE_HOSTTIER", "0"))
+    ),
+    # Two-tier GPU/SSD host tier (see VLLM_SSD_ROOT in the annotation block).
+    "VLLM_SSD_ROOT": lambda: os.getenv("VLLM_SSD_ROOT", ""),
+    "VLLM_SSD_QUOTA_BYTES": lambda: int(
+        os.getenv("VLLM_SSD_QUOTA_BYTES", str(8 * (1 << 30)))
+    ),
+    "VLLM_SSD_READ_THREADS": lambda: int(os.getenv("VLLM_SSD_READ_THREADS", "8")),
+    "VLLM_SSD_WRITE_THREADS": lambda: int(os.getenv("VLLM_SSD_WRITE_THREADS", "8")),
+    "VLLM_SSD_MAX_MBPS": lambda: int(os.getenv("VLLM_SSD_MAX_MBPS", "0")),
+    "VLLM_SSD_CLEAN_START": lambda: bool(
+        int(os.getenv("VLLM_SSD_CLEAN_START", "1"))
+    ),
+    "VLLM_SSD_CHUNK_SLOTS": lambda: int(os.getenv("VLLM_SSD_CHUNK_SLOTS", "0")),
+    "VLLM_SSD_ONLY": lambda: bool(int(os.getenv("VLLM_SSD_ONLY", "0"))),
+    "VLLM_HOSTTIER_EVICT_SMALL_TOKENS": lambda: int(
+        os.getenv("VLLM_HOSTTIER_EVICT_SMALL_TOKENS", "64000")
+    ),
+    # Diagnostic: skip Mamba boundary-state capture when spilling.
+    "VLLM_SPILL_NO_MAMBA": lambda: bool(
+        int(os.getenv("VLLM_SPILL_NO_MAMBA", "0"))
+    ),
+    # Diagnostic: trust a just-restored chain without connector reconciliation.
+    "VLLM_RESTORE_TRUST": lambda: bool(
+        int(os.getenv("VLLM_RESTORE_TRUST", "0"))
+    ),
+    # Diagnostic: append host-tier spill/restore traces to a log file.
+    "RAMTRACE": lambda: bool(int(os.getenv("RAMTRACE", "0"))),
+    "RAMTRACE_LOG": lambda: os.getenv("RAMTRACE_LOG", "/tmp/vllm_ramtrace.log"),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
         os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")

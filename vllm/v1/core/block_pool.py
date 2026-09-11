@@ -711,7 +711,13 @@ class BlockPool:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.remove(block)
+                if block.pinned == 0:
+                    # Ordinary idle cached block: unlink it from the free queue.
+                    self.free_block_queue.remove(block)
+                # Keep-alive / durable-pinned idle blocks are ALREADY withdrawn
+                # from the free queue (their ``pinned`` hold keeps them reserved
+                # while idle). Nothing to unlink; the ref++ below attaches the
+                # adopting request and the pin keeps ownership until unpin.
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -730,6 +736,10 @@ class BlockPool:
         for block in ordered_blocks:
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
+                # Keep-alive pinned blocks stay withdrawn from the free queue
+                # (they must never be handed to another request / evicted).
+                if block.pinned > 0:
+                    continue
                 # When caching is disabled we always append for better
                 # GPU cache locality from reusing recently used blocks
                 if block.block_hash is None and self.enable_caching:
@@ -740,6 +750,35 @@ class BlockPool:
         # Blocks without hash get evicted first - prepend them last to the tail
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
+
+    def pin_block(self, block: KVCacheBlock) -> None:
+        """Keep-alive a cached block: withdraw it from the free/eviction queue.
+
+        Safe to call on idle (ref_cnt == 0) or in-use (ref_cnt > 0) blocks.
+        The block must keep its prefix-cache hash; nothing may pop it while
+        pinned.
+        """
+        if block.is_null:
+            return
+        if block.pinned == 0 and block.ref_cnt == 0:
+            # Idle cached block currently sitting in the free queue: unlink it
+            # so allocations can never pop/evict it.
+            self.free_block_queue.remove(block)
+        block.pinned += 1
+
+    def unpin_block(self, block: KVCacheBlock) -> None:
+        """Release one keep-alive hold on a block.
+
+        Once the last hold is dropped and the block is idle, put it back on
+        the free queue so it becomes an ordinary eviction candidate again.
+        """
+        assert block.pinned > 0, "unpin_block on a block that is not pinned"
+        block.pinned -= 1
+        if block.pinned == 0 and block.ref_cnt == 0 and not block.is_null:
+            assert (
+                block.prev_free_block is None and block.next_free_block is None
+            ), "unpinned idle block must not already be linked in the free queue"
+            self.free_block_queue.append(block)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -758,6 +797,9 @@ class BlockPool:
                 f"only report block IDs that were allocated by the scheduler."
             )
             block = self.blocks[block_id]
+            if block.pinned > 0:
+                # Keep-alive protected: never strip its prefix-cache entry.
+                continue
             self._maybe_evict_cached_block(block)
 
     def reset_prefix_cache(self) -> bool:

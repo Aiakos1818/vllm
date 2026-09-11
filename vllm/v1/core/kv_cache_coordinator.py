@@ -168,7 +168,7 @@ class KVCacheCoordinator(ABC):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                part = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -177,8 +177,9 @@ class KVCacheCoordinator(ABC):
                     num_encoder_tokens,
                     apply_admission_cap=apply_admission_cap,
                 )
+                num_blocks_to_allocate += part
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                part = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -187,6 +188,21 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
+                num_blocks_to_allocate += part
+            if apply_admission_cap and envs.RAMTRACE:
+                try:
+                    with open(
+                        envs.RAMTRACE_LOG, "a"
+                    ) as _f:
+                        _f.write(
+                            f"gate grp{i} {type(manager).__name__} part={part} "
+                            f"ncomp={len(new_computed_blocks[i])} "
+                            f"ntok={num_tokens} ntokmm={num_tokens_main_model} "
+                            f"spec={getattr(manager, 'num_speculative_blocks', None)} "
+                            f"mode={getattr(manager, 'mamba_cache_mode', None)}\n"
+                        )
+                except Exception:
+                    pass
         return num_blocks_to_allocate
 
     def allocate_new_computed_blocks(
