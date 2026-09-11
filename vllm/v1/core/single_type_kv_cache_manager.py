@@ -1309,8 +1309,11 @@ class MambaManager(SingleTypeKVCacheManager):
             # one so the net in-flight footprint of this request stays flat.
             # That bounded footprint is what prevents the ~1.04x-concurrency
             # pool from being drained mid-prefill (which previously deadlocked
-            # a single long prefill at small cadences).
-            self._ckpt_anchors = max(1, envs.VLLM_MAMBA_CKPT_ANCHORS)
+            # a single long prefill at small cadences). Each cadence now keeps
+            # two anchors (``cadence`` and ``cadence - block_size``), so the
+            # cap is doubled to keep ``VLLM_MAMBA_CKPT_ANCHORS`` meaning
+            # "cadences of near-tail coverage".
+            self._ckpt_anchors = max(1, envs.VLLM_MAMBA_CKPT_ANCHORS) * 2
             self._durable_win: dict[str, list[KVCacheBlock]] = {}
 
     @classmethod
@@ -1486,19 +1489,10 @@ class MambaManager(SingleTypeKVCacheManager):
                     # this boundary can resume from it.
                     end_tokens = (last_state_block_idx + 1) * self.block_size
                     if (
-                        self._ckpt_tokens
-                        and end_tokens % self._ckpt_tokens == 0
-                        and end_tokens <= processed_computed_tokens
+                        end_tokens <= processed_computed_tokens
+                        and self._is_durable_boundary(end_tokens)
                     ):
-                        self.block_pool.pin_block(blk)
-                        win = self._durable_win.setdefault(request_id, [])
-                        win.append(blk)
-                        if len(win) > self._ckpt_anchors:
-                            # Keep the MOST RECENT anchors (reverts target the
-                            # tail); retire the oldest one to keep this
-                            # request's in-flight footprint flat.
-                            oldest = win.pop(0)
-                            self._release_durable_anchor(oldest)
+                        self._retain_durable_anchor(request_id, blk)
                     else:
                         self.block_pool.free_blocks([blk])
                     blocks[last_state_block_idx] = self._null_block
@@ -1511,6 +1505,33 @@ class MambaManager(SingleTypeKVCacheManager):
         pinned forever and permanently shrink the pool."""
         self.block_pool.unpin_block(blk)
         self.block_pool.free_blocks([blk])
+
+    def _is_durable_boundary(self, end_tokens: int) -> bool:
+        """True at a durable snapshot boundary: the cadence itself, or one
+        block before it (MTP sets ``use_eagle``, so the full-attention finder
+        drops one block and a truncation at ``cadence`` needs the state at
+        ``cadence - block_size``)."""
+        if not self._ckpt_tokens:
+            return False
+        return (
+            end_tokens % self._ckpt_tokens == 0
+            or (end_tokens + self.block_size) % self._ckpt_tokens == 0
+        )
+
+    def _retain_durable_anchor(
+        self, request_id: str, blk: KVCacheBlock
+    ) -> None:
+        """Pin ``blk`` and hand it to this request's durable window (newest
+        last), retiring the oldest anchor past the cap. No-op if the block is
+        already in the window (avoids a duplicate unpin at finish)."""
+        win = self._durable_win.setdefault(request_id, [])
+        if any(b is blk for b in win):
+            return
+        self.block_pool.pin_block(blk)
+        win.append(blk)
+        if len(win) > self._ckpt_anchors:
+            oldest = win.pop(0)
+            self._release_durable_anchor(oldest)
 
     def take_durable_window(self, request_id: str) -> list[KVCacheBlock]:
         """Hand over this request's surviving durable anchors to the caller

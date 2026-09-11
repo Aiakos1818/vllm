@@ -518,6 +518,15 @@ class Scheduler(SchedulerInterface):
             )
             if next_ckpt >= prefill_end:
                 next_ckpt = 0
+        # MTP (speculative decoding) makes the full-attention finder drop one
+        # block (`use_eagle`), so a request that would reuse the cadence anchor
+        # at ``cadence`` is reconciled down to ``cadence - block_size`` and needs
+        # an SSM state exactly there. Materialize that pre-cadence boundary too
+        # (it is retained as a durable anchor by the MambaManager) so both the
+        # eagle-dropped and the plain lookup can reuse an anchor.
+        pre_ckpt = 0
+        if next_ckpt and next_ckpt - block_size > 0:
+            pre_ckpt = next_ckpt - block_size
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
@@ -531,6 +540,8 @@ class Scheduler(SchedulerInterface):
             else 0,
             # Durable Mamba snapshot cadence boundary (see above).
             next_ckpt,
+            # Pre-cadence boundary for the MTP eagle drop (see above).
+            pre_ckpt,
             # Marconi shared-prefix junction, block-floored (a sub-block
             # junction's state is not separately cacheable): cache its state
             # so sibling requests sharing the prefix can reuse it.
