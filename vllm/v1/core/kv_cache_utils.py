@@ -72,8 +72,22 @@ def get_block_hash(key: BlockHashWithGroupId) -> BlockHash:
 
 
 def get_group_id(key: BlockHashWithGroupId) -> int:
-    """Extract the group id from a `BlockHashWithGroupId`."""
+    """Extract the `group id` from a `BlockHashWithGroupId`."""
     return int.from_bytes(key[-4:], "big", signed=False)
+
+
+def align_ckpt_tokens(requested: int, block_size: int) -> int:
+    """Floor a durable-snapshot cadence to a multiple of the mamba block size.
+
+    The engine picks the mamba/attention block size automatically (it depends on
+    the model, KV dtype and ``num_speculative_tokens``), so a fixed cadence such
+    as 32000 is only valid when the block size divides it (1600 does; 1584 does
+    not). Aligning here keeps the manager and the scheduler in agreement and
+    means the user never has to know the block size.
+    """
+    if requested <= 0 or block_size <= 0:
+        return 0
+    return max(1, requested // block_size) * block_size
 
 
 def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:

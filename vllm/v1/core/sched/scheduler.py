@@ -38,7 +38,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, align_ckpt_tokens
 from vllm.v1.kv_offload.base import BlockIDsLoadStoreSpec, GPULoadStoreSpec
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
@@ -507,7 +507,11 @@ class Scheduler(SchedulerInterface):
         # ending on it.
         ckpt_tokens = getattr(self, "_mamba_ckpt_tokens", None)
         if ckpt_tokens is None:
-            ckpt_tokens = envs.VLLM_MAMBA_CKPT_TOKENS
+            # Align to the (auto-selected) block size so the cadence boundaries
+            # are block-aligned and match the MambaManager's effective cadence.
+            ckpt_tokens = align_ckpt_tokens(
+                envs.VLLM_MAMBA_CKPT_TOKENS, block_size
+            )
             self._mamba_ckpt_tokens = ckpt_tokens
         next_ckpt = 0
         if ckpt_tokens:

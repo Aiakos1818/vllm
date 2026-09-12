@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     KVCacheBlock,
+    align_ckpt_tokens,
     resolve_block_hashes,
 )
 from vllm.v1.kv_cache_interface import (
@@ -1294,14 +1295,17 @@ class MambaManager(SingleTypeKVCacheManager):
             # boundary (interior-divergence reuse) instead of recomputing the
             # whole prefix. The scheduler stops prefill chunks exactly on these
             # boundaries so a real state snapshot is flushed there.
-            ckpt_tokens = envs.VLLM_MAMBA_CKPT_TOKENS
-            if ckpt_tokens and ckpt_tokens % self.block_size != 0:
-                logger.warning(
-                    "VLLM_MAMBA_CKPT_TOKENS=%s is not a multiple of mamba "
-                    "block_size=%s; disabling durable mamba snapshots.",
-                    ckpt_tokens, self.block_size,
+            ckpt_tokens = align_ckpt_tokens(
+                envs.VLLM_MAMBA_CKPT_TOKENS, self.block_size
+            )
+            if ckpt_tokens and ckpt_tokens != envs.VLLM_MAMBA_CKPT_TOKENS:
+                logger.info(
+                    "Mamba durable cadence aligned to the block size: "
+                    "requested=%s effective=%s (block_size=%s).",
+                    envs.VLLM_MAMBA_CKPT_TOKENS,
+                    ckpt_tokens,
+                    self.block_size,
                 )
-                ckpt_tokens = 0
             self._ckpt_tokens = ckpt_tokens
             # Per-request rolling window of durable (pinned) snapshot anchors.
             # Anchors are retained newest-first and capped at ``_ckpt_anchors``;

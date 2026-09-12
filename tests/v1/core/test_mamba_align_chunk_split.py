@@ -252,6 +252,50 @@ def test_durable_boundaries_survive_head_free(
     assert blocks[0].is_null and blocks[1].is_null
 
 
+def test_align_ckpt_tokens_floors_to_block_size() -> None:
+    from vllm.v1.core.kv_cache_utils import align_ckpt_tokens
+
+    assert align_ckpt_tokens(0, 1600) == 0
+    assert align_ckpt_tokens(32000, 1600) == 32000
+    assert align_ckpt_tokens(31680, 1584) == 31680
+    assert align_ckpt_tokens(32000, 1584) == 31680
+    assert align_ckpt_tokens(1000, 1584) == 1584
+    assert align_ckpt_tokens(32000, 0) == 0
+
+
+def test_mtp1_block_size_1584_cadence_aligns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MTP1 selects mamba block 1584, so cadence 32000 must floor to 31680."""
+    import sys
+
+    from vllm import envs
+
+    monkeypatch.setattr(sys.modules[__name__], "MAMBA_BLOCK_SIZE", 1584)
+    monkeypatch.setattr(envs, "VLLM_MAMBA_CKPT_TOKENS", 32000)
+    manager = _make_hybrid_kv_cache_manager()
+    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+    assert mamba.block_size == 1584
+    assert mamba._ckpt_tokens == 31680
+
+
+def test_scheduler_cadence_aligns_to_block_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scheduler's cadence boundaries are block-aligned too (MTP1/1584)."""
+    import sys
+
+    from vllm import envs
+    from vllm.v1.core.kv_cache_utils import align_ckpt_tokens
+
+    monkeypatch.setattr(sys.modules[__name__], "MAMBA_BLOCK_SIZE", 1584)
+    monkeypatch.setattr(envs, "VLLM_MAMBA_CKPT_TOKENS", 32000)
+    (request,) = create_requests(1, num_tokens=40000, block_size=ATTN_BLOCK_SIZE)
+    # The first chunk stops at the aligned pre-cadence (31680 - 1584), not at
+    # the raw 32000 - 1584 = 30416.
+    assert _split(request, 33000) == align_ckpt_tokens(32000, 1584) - 1584
+
+
 def test_resumed_session_reclaims_cached_anchors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
