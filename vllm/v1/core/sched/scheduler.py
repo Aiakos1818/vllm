@@ -3526,6 +3526,9 @@ class Scheduler(SchedulerInterface):
         if sess is None and self._ssd_store is not None:
             sess = self._ssd_store.find(request.block_hashes)
             ssd_mode = sess is not None
+            if sess is not None:
+                # LRU recency: a probed session counts as used.
+                self._ssd_store.touch(sess["sid"])
         if sess is None:
             self._ramtrace(
                 f"restore probe req={request.request_id} "

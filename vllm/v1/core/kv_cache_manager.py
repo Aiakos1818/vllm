@@ -681,8 +681,8 @@ class KVCacheManager:
         # Pin the chain across ALL single-type groups (attention + GDN/mamba):
         # a prefix-cache chain only survives if none of its pages is reused, and
         # reuse of a page in any group invalidates the whole chain in this build.
-        # ``block_size`` (per group, may differ) weights the entry size so
-        # release_pins_smallest can compare sessions by occupied cache tokens.
+        # ``block_size`` (per group, may differ) weights the entry size so the
+        # eviction sort can compare sessions by occupied cache tokens.
         for mgr_idx, manager in enumerate(managers):
             blocks = manager.req_to_blocks.get(request.request_id, ())
             if envs.RAMTRACE:
@@ -827,6 +827,7 @@ class KVCacheManager:
                 "num_blocks": len(entries),
                 "anchors": len(anchor_ids),
                 "parked_at": time.monotonic(),
+                "last_used": time.monotonic(),
             }
         )
         return len(entries)
@@ -864,21 +865,6 @@ class KVCacheManager:
 
     def num_ram_sessions(self) -> int:
         return len(self._ram_sessions)
-
-    def release_pins_smallest(self, need_free_blocks: int) -> int:
-        """Release keep-alive entries (smallest first) until there are enough
-        free blocks, or no pinned entries remain.
-
-        Returns the number of entries released.
-        """
-        released = 0
-        while self._auto_pin_entries:
-            if self.block_pool.get_num_free_blocks() >= need_free_blocks:
-                break
-            smallest = min(self._auto_pin_entries, key=lambda e: e["tokens"])
-            self._unpin_entry(smallest)
-            released += 1
-        return released
 
     # ------------------------------------------------------------------ #
     # Host-tier session spill (RAM parking).                             #
@@ -942,10 +928,10 @@ class KVCacheManager:
         """Move keep-alive entries into spill hold in host-tier eviction order.
 
         Small sessions (< ``VLLM_HOSTTIER_EVICT_SMALL_TOKENS``) are chosen
-        first, then large ones; within each tier the oldest is chosen first.
-        Unlike ``release_pins_smallest`` this does NOT unpin/free: blocks stay
-        pinned until their host store completes (correctness-first ordering),
-        then are released by ``confirm_spill``. Returns the chosen entries.
+        first, then large ones; within each tier the least recently used is
+        chosen first. This does NOT unpin/free: blocks stay pinned until their
+        host store completes (correctness-first ordering), then are released by
+        ``confirm_spill``. Returns the chosen entries.
         """
         chosen: list[dict[str, Any]] = []
         while self._auto_pin_entries:
@@ -953,7 +939,9 @@ class KVCacheManager:
                 break
             victim = min(
                 self._auto_pin_entries,
-                key=lambda e: evict_sort_key(e["tokens"], e["parked_at"]),
+                key=lambda e: evict_sort_key(
+                    e["tokens"], e.get("last_used", e["parked_at"])
+                ),
             )
             req_id = victim["req_id"]
             self._auto_pin_entries.remove(victim)
@@ -1091,6 +1079,7 @@ class KVCacheManager:
             "num_blocks": entry["num_blocks"],
             "slots": slots or [],
             "parked_at": time.monotonic(),
+            "last_used": time.monotonic(),
         }
         if envs.RAMTRACE:
             try:
@@ -1111,10 +1100,10 @@ class KVCacheManager:
     def evict_ram_for(self, need: int, protect: str | None = None) -> int:
         """Free host slots by dropping parked sessions in eviction order.
 
-        Small sessions go first, then large ones; within each tier the oldest
-        parked session is dropped first. ``protect`` (the session being
-        restored, i.e. X) is never dropped. Returns the number of sessions
-        dropped.
+        Small sessions go first, then large ones; within each tier the least
+        recently used session (LRU, by ``last_used``) is dropped first.
+        ``protect`` (the session being restored, i.e. X) is never dropped.
+        Returns the number of sessions dropped.
         """
         dropped = 0
         while self.ram_slots_free() < need:
@@ -1127,7 +1116,9 @@ class KVCacheManager:
                 break
             victim = min(
                 candidates,
-                key=lambda s: evict_sort_key(s["tokens"], s["parked_at"]),
+                key=lambda s: evict_sort_key(
+                    s["tokens"], s.get("last_used", s["parked_at"])
+                ),
             )
             self._ram_sessions.pop(victim["req_id"], None)
             self.free_ram_slots(victim["slots"])
@@ -1173,6 +1164,10 @@ class KVCacheManager:
             if hit:
                 best = sess
                 best_len = n
+        if best is not None:
+            # LRU recency: a session that is being probed for restore counts as
+            # used, so it is not the first victim of the next eviction.
+            best["last_used"] = time.monotonic()
         return best
 
     def allocate_restore_blocks(

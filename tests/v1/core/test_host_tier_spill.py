@@ -80,28 +80,32 @@ def test_evict_ram_for_two_tier_then_oldest() -> None:
         "tokens": 80_000,
         "slots": big_old,
         "parked_at": 1.0,
+        "last_used": 1.0,
     }
     manager._ram_sessions["big_new"] = {
         "req_id": "big_new",
         "tokens": 90_000,
         "slots": big_new,
         "parked_at": 2.0,
+        "last_used": 2.0,
     }
     manager._ram_sessions["small_old"] = {
         "req_id": "small_old",
         "tokens": 1_000,
         "slots": small_old,
         "parked_at": 3.0,
+        "last_used": 3.0,
     }
     manager._ram_sessions["small_new"] = {
         "req_id": "small_new",
         "tokens": 2_000,
         "slots": small_new,
         "parked_at": 4.0,
+        "last_used": 4.0,
     }
     assert manager.ram_slots_free() == 0
 
-    # Small tier drains first (oldest-first), then the large tier.
+    # Small tier drains first (LRU-first), then the large tier.
     manager.evict_ram_for(1)
     assert set(manager._ram_sessions) == {"big_old", "big_new", "small_new"}
     manager.evict_ram_for(3)
@@ -112,6 +116,45 @@ def test_evict_ram_for_two_tier_then_oldest() -> None:
     # Protected session is never dropped, even when nothing else remains.
     manager.evict_ram_for(100, protect="big_new")
     assert "big_new" in manager._ram_sessions
+
+
+def test_evict_ram_for_uses_last_used_not_park_time() -> None:
+    """A session parked long ago but used recently outlives a newer park."""
+    manager = make_manager()
+    manager.set_ram_capacity(8)
+    old_but_hot = manager.alloc_ram_slots(4)
+    new_but_cold = manager.alloc_ram_slots(4)
+    manager._ram_sessions["old_but_hot"] = {
+        "req_id": "old_but_hot",
+        "tokens": 80_000,
+        "slots": old_but_hot,
+        "parked_at": 1.0,
+        "last_used": 9.0,
+    }
+    manager._ram_sessions["new_but_cold"] = {
+        "req_id": "new_but_cold",
+        "tokens": 90_000,
+        "slots": new_but_cold,
+        "parked_at": 2.0,
+        "last_used": 2.0,
+    }
+    manager.evict_ram_for(4)
+    assert set(manager._ram_sessions) == {"old_but_hot"}
+
+
+def test_find_ram_session_refreshes_recency() -> None:
+    manager = make_manager()
+    manager._ram_sessions["s"] = {
+        "req_id": "s",
+        "tail": b"h2",
+        "tokens": 20,
+        "grp_hashes": [[b"h0", b"h1", b"h2"]],
+        "slots": [0, 1, 2],
+        "parked_at": 1.0,
+        "last_used": 1.0,
+    }
+    assert manager.find_ram_session([b"h0", b"h1", b"h2"]) is not None
+    assert manager._ram_sessions["s"]["last_used"] > 1.0
 
 
 def test_find_ram_session_tail_and_prefix() -> None:
@@ -146,6 +189,7 @@ def test_take_spill_candidates_two_tier_then_oldest() -> None:
                 "req_id": req_id,
                 "tokens": tokens,
                 "parked_at": parked_at,
+                "last_used": parked_at,
                 "blocks": [],
                 "grp_blocks": [],
             }

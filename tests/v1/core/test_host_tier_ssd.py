@@ -191,6 +191,30 @@ def test_evict_prefers_small_then_oldest(tmp_path) -> None:
     close_view(buf, view, flat)
 
 
+def test_touch_makes_session_most_recent(tmp_path) -> None:
+    buf, view, flat = make_view(16)
+    store = make_store(tmp_path, view, quota_bytes=2 * 2 * ROW)
+    nbytes = 2 * ROW
+    for i, sid in enumerate(("a", "b")):
+        store.evict_for(nbytes)
+        assert (
+            store.submit_store(
+                sid, [i, i + 1], [[bytes([i]) * 16]], tail(i), 80_000
+            )
+            is not None
+        )
+        wait_n(store, 1)
+
+    # "a" was parked first but is touched afterwards, so "b" is the LRU victim.
+    store.touch("a")
+    store.evict_for(nbytes)
+    assert store.find([tail(0)]) is not None
+    assert store.find([tail(1)]) is None
+
+    store.shutdown()
+    close_view(buf, view, flat)
+
+
 def test_store_failure_cleans_up(tmp_path, monkeypatch) -> None:
     buf, view, flat = make_view(8)
     store = make_store(tmp_path, view)

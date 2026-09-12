@@ -32,15 +32,15 @@ from vllm.v1.kv_offload.tiering.fs.io import (
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 
-def evict_sort_key(tokens: int, age: float) -> tuple[int, float]:
-    """Host-tier eviction order: small sessions first, oldest within a tier.
+def evict_sort_key(tokens: int, last_used: float) -> tuple[int, float]:
+    """Host-tier eviction order: small sessions first, LRU within a tier.
 
     ``VLLM_HOSTTIER_EVICT_SMALL_TOKENS`` splits sessions into a small tier
-    (evicted first) and a large tier; both tiers are ordered oldest-first.
-    A non-positive threshold collapses the two tiers into one (pure oldest).
+    (evicted first) and a large tier; both tiers are ordered least-recently-used
+    first. A non-positive threshold collapses the two tiers into one (pure LRU).
     """
     small = envs.VLLM_HOSTTIER_EVICT_SMALL_TOKENS
-    return (1 if 0 < small <= tokens else 0, age)
+    return (1 if 0 < small <= tokens else 0, last_used)
 
 logger = init_logger(__name__)
 
