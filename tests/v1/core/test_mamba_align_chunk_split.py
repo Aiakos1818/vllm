@@ -209,6 +209,41 @@ def test_poisoning_is_block_size_independent(
     assert _prefill(prompt_len, budgets=budgets) > 0
 
 
+def test_durable_boundaries_survive_head_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The head-prefix free must not drop durable snapshot boundaries.
+
+    `remove_skipped_blocks` frees the whole skipped range before the manager's
+    retention logic runs, so a state block sitting at `cadence - block_size`
+    (the pre-cadence anchor MTP needs) was freed before it could be pinned.
+    A restored request then found no anchor and replayed the prefix.
+    """
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_MAMBA_CKPT_TOKENS", 2 * MAMBA_BLOCK_SIZE)
+    manager = _make_hybrid_kv_cache_manager()
+    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+    assert mamba._ckpt_tokens == 2 * MAMBA_BLOCK_SIZE
+
+    (request,) = create_requests(1, num_tokens=3602, block_size=ATTN_BLOCK_SIZE)
+    _run_chunked_prefill(manager, request, [])
+    assert request.num_computed_tokens == 3602
+
+    # A later step frees the head prefix up to the prompt end.
+    mamba.remove_skipped_blocks(request.request_id, 3602, 3602)
+
+    win = mamba.take_durable_window(request.request_id)
+    assert sorted(b.block_hash_num_tokens for b in win) == [
+        MAMBA_BLOCK_SIZE,
+        2 * MAMBA_BLOCK_SIZE,
+    ]
+    assert all(b.pinned for b in win)
+    # The retained entries are detached from the table like any freed block.
+    blocks = mamba.req_to_blocks[request.request_id]
+    assert blocks[0].is_null and blocks[1].is_null
+
+
 @pytest.mark.parametrize("partial_hit", [False, True])
 @pytest.mark.parametrize("resume_at", [331, 1599, 1601, 2531, 3011])
 def test_unaligned_resume_never_runs_past_its_block(

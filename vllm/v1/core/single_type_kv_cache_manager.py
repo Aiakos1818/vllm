@@ -1497,6 +1497,43 @@ class MambaManager(SingleTypeKVCacheManager):
                         self.block_pool.free_blocks([blk])
                     blocks[last_state_block_idx] = self._null_block
 
+    def _remove_blocks_in_range(
+        self,
+        request_id: str,
+        first_block: int,
+        last_block: int,
+    ) -> None:
+        """Head-prefix free that exempts durable snapshot boundaries.
+
+        The base implementation frees the whole ``[first_block, last_block)``
+        run before this manager's own retention logic runs, so a state block
+        at a durable boundary (e.g. ``cadence - block_size``) that happens to
+        sit inside the range would be gone by the time ``remove_skipped_blocks``
+        looks for it. Retain those blocks (pinned, in the durable window)
+        instead of freeing them; the window cap still bounds how many survive.
+        """
+        if not (self.mamba_cache_mode == "align" and self._ckpt_tokens):
+            return super()._remove_blocks_in_range(request_id, first_block, last_block)
+        if request_id not in self.req_to_blocks or first_block >= last_block:
+            return
+        blocks = self.req_to_blocks[request_id]
+        last_block = min(last_block, len(blocks))
+
+        freed: list[KVCacheBlock] = []
+        for i in range(last_block - 1, first_block - 1, -1):
+            if blocks[i] == self._null_block:
+                break
+            blk = blocks[i]
+            if self._is_durable_boundary((i + 1) * self.block_size):
+                # Keep the allocation ref (window / keep-alive drops it later);
+                # do not add it to ``freed`` or the refcount goes negative.
+                self._retain_durable_anchor(request_id, blk)
+            else:
+                freed.append(blk)
+            blocks[i] = self._null_block
+        if freed:
+            self.block_pool.free_blocks(freed)
+
     def _release_durable_anchor(self, blk: KVCacheBlock) -> None:
         """Turn a durable (pinned during its owner's run) anchor back into an
         ordinary cached block: drop the keep-alive hold and free the block so
