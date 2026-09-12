@@ -78,6 +78,8 @@ def _split(
     num_new_tokens: int,
     use_eagle: bool = True,
     partial_hit: bool = False,
+    num_new_local_computed_tokens: int = 0,
+    num_external_computed_tokens: int = 0,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
@@ -89,7 +91,13 @@ def _split(
         mamba_partial_cache_hit=partial_hit,
         hash_block_size=ATTN_BLOCK_SIZE,
     )
-    return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
+    return Scheduler._mamba_block_aligned_split(
+        stub,
+        request,
+        num_new_tokens,
+        num_new_local_computed_tokens,
+        num_external_computed_tokens,
+    )
 
 
 def _run_chunked_prefill(
@@ -242,6 +250,156 @@ def test_durable_boundaries_survive_head_free(
     # The retained entries are detached from the table like any freed block.
     blocks = mamba.req_to_blocks[request.request_id]
     assert blocks[0].is_null and blocks[1].is_null
+
+
+def test_resumed_session_reclaims_cached_anchors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request resuming from the prefix cache re-claims the session's durable
+    anchors instead of leaving them as unowned idle blocks.
+
+    A mamba prefix hit adopts only the single state block at the resume
+    boundary; without the re-claim the older anchors are neither protected by
+    the resumed request's window nor carried into its keep-alive entry, so a
+    second park/restore cycle loses them and a deep revert recomputes.
+    """
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_MAMBA_CKPT_TOKENS", 2 * MAMBA_BLOCK_SIZE)
+    manager = _make_hybrid_kv_cache_manager()
+    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+
+    (producer,) = create_requests(
+        1,
+        num_tokens=3602,
+        block_size=ATTN_BLOCK_SIZE,
+        same_prompt=True,
+        req_ids=["producer"],
+    )
+    _run_chunked_prefill(manager, producer, [])
+    mamba.remove_skipped_blocks(producer.request_id, 3602, 3602)
+    anchors = mamba.take_durable_window(producer.request_id)
+    assert sorted(b.block_hash_num_tokens for b in anchors) == [
+        MAMBA_BLOCK_SIZE,
+        2 * MAMBA_BLOCK_SIZE,
+    ]
+    # The session goes to the host tier and comes back: its anchors are
+    # re-loaded as ordinary idle cached blocks (hash kept, no owner).
+    for blk in anchors:
+        mamba._release_durable_anchor(blk)
+    manager.free(producer)
+
+    (consumer,) = create_requests(
+        1,
+        num_tokens=3602,
+        block_size=ATTN_BLOCK_SIZE,
+        same_prompt=True,
+        req_ids=["consumer"],
+    )
+    # The consumer is scheduled in a later step than the producer.
+    manager.new_step_starts()
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(consumer)
+    assert num_computed >= 2 * MAMBA_BLOCK_SIZE
+    num_new = _split(
+        consumer,
+        consumer.num_tokens - num_computed,
+        num_new_local_computed_tokens=num_computed,
+    )
+    assert (
+        manager.allocate_slots(
+            consumer,
+            num_new,
+            num_new_computed_tokens=num_computed,
+            new_computed_blocks=computed_blocks,
+            num_lookahead_tokens=NUM_SPEC,
+        )
+        is not None
+    )
+
+    win = mamba._durable_win.get(consumer.request_id, [])
+    assert all(b.pinned for b in win)
+    adopted = mamba.take_durable_window(consumer.request_id)
+    assert sorted((b.block_id, b.block_hash_num_tokens) for b in adopted) == sorted(
+        (b.block_id, b.block_hash_num_tokens) for b in anchors
+    )
+
+
+def test_preempted_request_does_not_re_adopt_anchors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-scheduled (preempted) request must not re-claim its own anchors.
+
+    After preemption the cached anchors are this request's own idle blocks;
+    pinning them would withdraw them from the free queue and starve the
+    request's next allocation (pool-boundary livelock).
+    """
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_MAMBA_CKPT_TOKENS", 2 * MAMBA_BLOCK_SIZE)
+    manager = _make_hybrid_kv_cache_manager()
+    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+
+    (producer,) = create_requests(
+        1,
+        num_tokens=3602,
+        block_size=ATTN_BLOCK_SIZE,
+        same_prompt=True,
+        req_ids=["producer"],
+    )
+    _run_chunked_prefill(manager, producer, [])
+    mamba.remove_skipped_blocks(producer.request_id, 3602, 3602)
+    for blk in mamba.take_durable_window(producer.request_id):
+        mamba._release_durable_anchor(blk)
+    manager.free(producer)
+
+    (consumer,) = create_requests(
+        1,
+        num_tokens=3602,
+        block_size=ATTN_BLOCK_SIZE,
+        same_prompt=True,
+        req_ids=["consumer"],
+    )
+    manager.new_step_starts()
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(consumer)
+    assert (
+        manager.allocate_slots(
+            consumer,
+            _split(
+                consumer,
+                consumer.num_tokens - num_computed,
+                num_new_local_computed_tokens=num_computed,
+            ),
+            num_new_computed_tokens=num_computed,
+            new_computed_blocks=computed_blocks,
+            num_lookahead_tokens=NUM_SPEC,
+        )
+        is not None
+    )
+    assert mamba._durable_win.get(consumer.request_id)
+
+    # Preempt: the window and the request's blocks are released.
+    manager.free(consumer)
+    consumer.num_preemptions = 1
+
+    # Re-schedule: the prefix hits again, but the anchors stay unowned.
+    manager.new_step_starts()
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(consumer)
+    assert num_computed >= 2 * MAMBA_BLOCK_SIZE
+    assert (
+        manager.allocate_slots(
+            consumer,
+            _split(
+                consumer,
+                consumer.num_tokens - num_computed,
+                num_new_local_computed_tokens=num_computed,
+            ),
+            num_new_computed_tokens=num_computed,
+            new_computed_blocks=computed_blocks,
+            num_lookahead_tokens=NUM_SPEC,
+        )
+        is not None
+    )
+    assert not mamba._durable_win.get(consumer.request_id)
 
 
 @pytest.mark.parametrize("partial_hit", [False, True])

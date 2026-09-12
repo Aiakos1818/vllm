@@ -1315,6 +1315,10 @@ class MambaManager(SingleTypeKVCacheManager):
             # "cadences of near-tail coverage".
             self._ckpt_anchors = max(1, envs.VLLM_MAMBA_CKPT_ANCHORS) * 2
             self._durable_win: dict[str, list[KVCacheBlock]] = {}
+            # Requests whose cached durable anchors were already re-claimed
+            # from the prefix cache (once per request, on its first cache call
+            # after a prefix hit).
+            self._anchor_adopt_reqs: set[str] = set()
 
     @classmethod
     def find_longest_cache_hit(
@@ -1584,6 +1588,57 @@ class MambaManager(SingleTypeKVCacheManager):
             return []
         return self._durable_win.pop(request_id, [])
 
+    def _adopt_cached_durable_anchors(
+        self, request: Request, num_tokens: int
+    ) -> None:
+        """Re-claim this session's durable snapshots from the prefix cache.
+
+        A mamba prefix hit adopts only the single state block at the resume
+        boundary; the older durable snapshots stay in the shared cache as
+        unowned idle blocks, so they are neither protected by this request's
+        window nor carried into its keep-alive entry (a later park/restore
+        cycle would then lose them and deep reverts would recompute). Claim
+        the cached ones (touch -> pin -> window) so a resumed session keeps
+        its near-tail anchors exactly like a fresh one; the window cap still
+        bounds how many survive.
+        """
+        if not self._ckpt_tokens:
+            return
+        block_hashes = resolve_block_hashes(
+            request.block_hashes,
+            self.block_pool.hash_block_size,
+            self.block_size,
+        )
+        max_idx = min(len(block_hashes), num_tokens // self.block_size) - 1
+        claimed = 0
+        for idx in range(max_idx, -1, -1):
+            if claimed >= self._ckpt_anchors:
+                break
+            if not self._is_durable_boundary((idx + 1) * self.block_size):
+                continue
+            found = self.block_pool.get_cached_block(
+                block_hashes[idx], [self.kv_cache_group_id]
+            )
+            if not found or found[0].block_hash is None:
+                continue
+            win = self._durable_win.get(request.request_id, ())
+            if any(b is found[0] for b in win):
+                continue
+            # ref 0 -> 1: the block joins this request's chain, so the finish
+            # path (window hand-over) drops it back to 0 like a run anchor.
+            self.block_pool.touch(found)
+            self._retain_durable_anchor(request.request_id, found[0])
+            claimed += 1
+            if envs.RAMTRACE:
+                try:
+                    with open(envs.RAMTRACE_LOG, "a") as _f:
+                        _f.write(
+                            f"adopt anchor req={request.request_id} "
+                            f"idx={idx} blk={found[0].block_id}\n"
+                        )
+                except Exception:
+                    pass
+
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
         cascade attention is not supported by mamba
@@ -1806,6 +1861,7 @@ class MambaManager(SingleTypeKVCacheManager):
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
+            self._anchor_adopt_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
             # Release this request's durable anchors now that it is finished:
@@ -1842,6 +1898,19 @@ class MambaManager(SingleTypeKVCacheManager):
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
+            if request.request_id not in self._anchor_adopt_reqs:
+                # First cache call for this request. A prefix hit (resumed
+                # session) has already set ``num_cached_block``; its older
+                # durable snapshots sit in the prefix cache unowned, so claim
+                # them into this request's window to keep them protected and
+                # carried into its keep-alive entry at finish.
+                self._anchor_adopt_reqs.add(request.request_id)
+                if num_cached_blocks_before > 0 and request.num_preemptions == 0:
+                    # Only on the request's first scheduling: after a
+                    # preemption the cached anchors are this request's own
+                    # idle blocks, and pinning them would starve its next
+                    # allocation (pool-boundary livelock).
+                    self._adopt_cached_durable_anchors(request, num_tokens)
             partial_hash = self._cache_partial_tail_block(request, num_tokens)
             if partial_hash is not None:
                 self.cached_blocks_this_step.add(partial_hash)
