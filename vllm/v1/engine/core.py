@@ -363,6 +363,10 @@ class EngineCore:
         self._log_pooler_config(supported_tasks)
         return supported_tasks
 
+    def host_tier_info(self) -> dict[str, Any]:
+        """Host-tier config + parked chains (see ``GET /host_tier_info``)."""
+        return self.scheduler.host_tier_info()
+
     def _log_pooler_config(self, supported_tasks: tuple[SupportedTask, ...]) -> None:
         if self._pooler_config_logged:
             return

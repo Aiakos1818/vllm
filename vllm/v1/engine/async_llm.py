@@ -280,6 +280,9 @@ class AsyncLLM(EngineClient):
 
         return self._supported_tasks
 
+    async def host_tier_info(self) -> dict:
+        return await self.engine_core.call_utility_async("host_tier_info")
+
     async def add_request(
         self,
         request_id: str,

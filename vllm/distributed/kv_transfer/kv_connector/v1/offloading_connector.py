@@ -84,6 +84,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         """Number of host-tier CPU slots available (per worker)."""
         return self._spec.num_blocks
 
+    def cpu_slot_bytes(self) -> int:
+        """Bytes per host-tier CPU slot (per worker)."""
+        return int(getattr(self._spec, "kv_bytes_per_chunk", 0))
+
     def cpu_engine_id(self) -> str:
         """Engine id naming this instance's shared host KV region."""
         return self._spec.config.engine_id

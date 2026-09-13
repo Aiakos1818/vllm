@@ -7,10 +7,13 @@ eviction order, session matching) and the scheduler's restore-slot lifetime
 contract without spinning up an engine.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.sched import scheduler as scheduler_module
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -226,6 +229,7 @@ def test_confirm_spill_parks_metadata_without_blocks() -> None:
         "tail": b"tailhash",
         "tokens": 8,
         "num_blocks": 2,
+        "anchors": 3,
         "blocks": [],
         "grp_blocks": [[block]],
     }
@@ -236,7 +240,71 @@ def test_confirm_spill_parks_metadata_without_blocks() -> None:
     assert session["slots"] == slots
     assert session["grp_hashes"] == [[b"tailhash"]]
     assert session["tokens"] == 8
+    assert session["anchors"] == 3
     assert "r" not in manager._spill_hold
+
+
+def test_matches_pinned_chain_refreshes_recency() -> None:
+    """A resumed keep-alive chain becomes most-recently-used (true LRU)."""
+    manager = make_manager()
+    manager._auto_pin_entries.append(
+        {
+            "req_id": "s",
+            "tail": b"t2",
+            "tokens": 20,
+            "blocks": [],
+            "grp_blocks": [],
+            "anchors": 1,
+            "parked_at": 1.0,
+            "last_used": 1.0,
+        }
+    )
+    assert manager.matches_pinned_chain([b"t0", b"t1", b"t2"])
+    assert manager._auto_pin_entries[0]["last_used"] > 1.0
+
+    # A miss (or an empty prompt) leaves recency untouched.
+    manager._auto_pin_entries[0]["last_used"] = 5.0
+    assert not manager.matches_pinned_chain([b"x0"])
+    assert not manager.matches_pinned_chain([])
+    assert manager._auto_pin_entries[0]["last_used"] == 5.0
+
+
+def test_host_tier_snapshots_report_anchors() -> None:
+    manager = make_manager()
+    manager._auto_pin_entries.append(
+        {
+            "req_id": "g",
+            "tail": b"t",
+            "tokens": 40,
+            "blocks": [object(), object()],
+            "grp_blocks": [],
+            "anchors": 2,
+            "parked_at": 1.0,
+            "last_used": 3.0,
+        }
+    )
+    manager._ram_sessions["r"] = {
+        "req_id": "r",
+        "tokens": 20,
+        "num_blocks": 5,
+        "slots": [0, 1],
+        "anchors": 1,
+        "parked_at": 2.0,
+        "last_used": 4.0,
+    }
+    assert manager.pinned_chain_snapshot() == [
+        {"id": "g", "tokens": 40, "blocks": 2, "anchors": 2, "last_used": 3.0}
+    ]
+    assert manager.ram_session_snapshot() == [
+        {
+            "id": "r",
+            "tokens": 20,
+            "blocks": 5,
+            "slots": 2,
+            "anchors": 1,
+            "last_used": 4.0,
+        }
+    ]
 
 
 def test_pinned_hit_blocks_are_not_evictable() -> None:
@@ -393,3 +461,77 @@ def test_hold_and_release_restored_blocks() -> None:
     assert manager.block_pool.get_num_free_blocks() == free_before
     manager.release_restored_hold(blocks)
     assert manager.block_pool.get_num_free_blocks() == free_before + 2
+
+
+class _InfoScheduler:
+    """Minimal host for ``Scheduler.host_tier_info``."""
+
+    host_tier_info = Scheduler.host_tier_info
+    _ram_slot_bytes = Scheduler._ram_slot_bytes
+
+    def __init__(self, manager: KVCacheManager, connector=None, store=None) -> None:
+        self.kv_cache_manager = manager
+        self._ssd_store = store
+        self.connector = connector
+        self._ssd_chunk_slots = 7
+        self.block_size = 4
+        self.kv_cache_config = object()
+        self.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(model="m", max_model_len=1000),
+            scheduler_config=SimpleNamespace(max_num_seqs=1),
+            cache_config=SimpleNamespace(kv_cache_memory_bytes=123),
+            kv_transfer_config=None,
+        )
+
+
+class _SlotConnector:
+    def cpu_slot_bytes(self) -> int:
+        return 100
+
+
+def test_host_tier_info(monkeypatch) -> None:
+    manager = make_manager()
+    manager.set_ram_capacity(4)
+    manager._auto_pin_entries.append(
+        {
+            "req_id": "g",
+            "tail": b"t",
+            "tokens": 40,
+            "blocks": [object(), object()],
+            "grp_blocks": [],
+            "anchors": 2,
+            "parked_at": 1.0,
+            "last_used": 1.0,
+        }
+    )
+    manager._ram_sessions["r"] = {
+        "req_id": "r",
+        "tokens": 20,
+        "num_blocks": 5,
+        "slots": [0, 1],
+        "anchors": 1,
+        "parked_at": 2.0,
+        "last_used": 2.0,
+    }
+    monkeypatch.setattr(
+        scheduler_module, "get_kv_cache_capacity", lambda *_: (999, 1.0)
+    )
+    scheduler = _InfoScheduler(manager, connector=_SlotConnector())
+
+    info = scheduler.host_tier_info()
+
+    assert info["config"]["gpu_total_tokens"] == 999
+    assert info["config"]["staging_slots"] == 4
+    assert info["config"]["chunk_slots"] == 7
+    assert info["config"]["block_size"] == 4
+    assert info["config"]["ram_slot_bytes"] == 100
+    assert info["config"]["ssd"]["enabled"] is False
+
+    sessions = info["sessions"]
+    assert [s["id"] for s in sessions["gpu"]] == ["g"]
+    assert sessions["gpu"][0]["anchors"] == 2
+    assert sessions["gpu"][0]["bytes"] == 2 * 100
+    assert sessions["ram"][0]["bytes"] == 2 * 100
+    assert sessions["ssd"] == []
+    # last_used is exported as an absolute epoch, not a monotonic tick.
+    assert sessions["gpu"][0]["last_used"] > 1_000_000_000.0

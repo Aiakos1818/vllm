@@ -177,6 +177,21 @@ class HostTierSSDStore:
         with self._lock:
             return self._bytes_used
 
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Committed parked sessions (for diagnostics/monitoring)."""
+        with self._lock:
+            return [
+                {
+                    "sid": s["sid"],
+                    "tokens": s["tokens"],
+                    "blocks": s["n_slots"],
+                    "bytes": s["bytes"],
+                    "anchors": s.get("anchors", 0),
+                    "last_used": s["last_used"],
+                }
+                for s in self._sessions.values()
+            ]
+
     def session_dir(self, sid: str) -> str:
         return os.path.join(self._sessions_dir, _safe_name(sid))
 
@@ -303,6 +318,7 @@ class HostTierSSDStore:
         grp_hashes: list[list[bytes]],
         tail: bytes | None,
         tokens: int,
+        anchors: int = 0,
     ) -> bool:
         """Reserve quota for a session that will be written in chunks.
 
@@ -345,6 +361,7 @@ class HostTierSSDStore:
             "tokens": tokens,
             "n_slots": total_slots,
             "bytes": total_bytes,
+            "anchors": int(anchors),
             "dir": directory,
             "last_used": time.monotonic(),
         }

@@ -866,6 +866,33 @@ class KVCacheManager:
     def num_ram_sessions(self) -> int:
         return len(self._ram_sessions)
 
+    def pinned_chain_snapshot(self) -> list[dict[str, Any]]:
+        """Per-chain view of keep-alive pinned chains (for monitoring)."""
+        return [
+            {
+                "id": e["req_id"],
+                "tokens": e["tokens"],
+                "blocks": len(e["blocks"]),
+                "anchors": e.get("anchors", 0),
+                "last_used": e.get("last_used", e["parked_at"]),
+            }
+            for e in self._auto_pin_entries
+        ]
+
+    def ram_session_snapshot(self) -> list[dict[str, Any]]:
+        """Per-chain view of RAM-parked sessions (for monitoring)."""
+        return [
+            {
+                "id": s["req_id"],
+                "tokens": s["tokens"],
+                "blocks": s["num_blocks"],
+                "slots": len(s["slots"]),
+                "anchors": s.get("anchors", 0),
+                "last_used": s.get("last_used", s["parked_at"]),
+            }
+            for s in self._ram_sessions.values()
+        ]
+
     # ------------------------------------------------------------------ #
     # Host-tier session spill (RAM parking).                             #
     # ------------------------------------------------------------------ #
@@ -883,13 +910,22 @@ class KVCacheManager:
                 pass
 
     def matches_pinned_chain(self, block_hashes: list[bytes]) -> bool:
-        """True if a keep-alive pinned chain's tail is in this request's hashes."""
+        """True if a keep-alive pinned chain's tail is in this request's hashes.
+
+        A match means the chain is being resumed, so refresh its recency
+        (``last_used``) to keep the host-tier eviction order a true LRU.
+        """
         if not block_hashes:
             return False
         bh = set(block_hashes)
-        return any(
-            e["tail"] is not None and e["tail"] in bh for e in self._auto_pin_entries
-        )
+        now = None
+        for entry in self._auto_pin_entries:
+            if entry["tail"] is not None and entry["tail"] in bh:
+                if now is None:
+                    now = time.monotonic()
+                entry["last_used"] = now
+                return True
+        return False
 
     def ram_slots_free(self) -> int:
         return sum(length for _, length in self._ram_free)
@@ -982,6 +1018,7 @@ class KVCacheManager:
             "tail": entry["tail"],
             "grp_hashes": grp_hashes,
             "tokens": entry["tokens"],
+            "anchors": entry.get("anchors", 0),
         }
 
     def release_spill_blocks(
@@ -1015,6 +1052,7 @@ class KVCacheManager:
             "tail": entry["tail"],
             "grp_hashes": grp_hashes,
             "tokens": entry["tokens"],
+            "anchors": entry.get("anchors", 0),
         }
 
     def hold_restored_blocks(
@@ -1077,6 +1115,7 @@ class KVCacheManager:
             "grp_hashes": grp_hashes,
             "tokens": entry["tokens"],
             "num_blocks": entry["num_blocks"],
+            "anchors": entry.get("anchors", 0),
             "slots": slots or [],
             "parked_at": time.monotonic(),
             "last_used": time.monotonic(),

@@ -249,6 +249,10 @@ class EngineClient(ABC):
         """Get supported tasks"""
         raise NotImplementedError
 
+    async def host_tier_info(self) -> dict:
+        """Get host-tier config and parked-chain inventory."""
+        raise NotImplementedError
+
     async def init_weight_transfer_engine(
         self, init_request: WeightTransferInitRequest
     ) -> None:

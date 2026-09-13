@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -38,7 +39,11 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, align_ckpt_tokens
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    align_ckpt_tokens,
+    get_kv_cache_capacity,
+)
 from vllm.v1.kv_offload.base import BlockIDsLoadStoreSpec, GPULoadStoreSpec
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
@@ -2790,6 +2795,89 @@ class Scheduler(SchedulerInterface):
         self._host_tier_ssd_read_bytes = 0
         return stats
 
+    def host_tier_info(self) -> dict[str, Any]:
+        """Host-tier config + parked chains, served by ``/host_tier_info``.
+
+        ``last_used`` is converted from monotonic to epoch so an idle engine
+        (no stats ticks) still yields correct idle times on the monitor.
+        """
+        kvm = self.kv_cache_manager
+        gpu_total_tokens, _ = get_kv_cache_capacity(
+            self.vllm_config, self.kv_cache_config
+        )
+        slot_bytes = self._ram_slot_bytes()
+        page_bytes = (
+            self._ssd_store.row_bytes if self._ssd_store is not None else slot_bytes
+        )
+        now_mono = time.monotonic()
+        now_wall = time.time()
+
+        def _epoch(mono: float) -> float:
+            return now_wall - (now_mono - mono)
+
+        gpu = kvm.pinned_chain_snapshot()
+        ram = kvm.ram_session_snapshot()
+        ssd = self._ssd_store.snapshot() if self._ssd_store is not None else []
+        for sess in gpu:
+            sess["bytes"] = sess["blocks"] * page_bytes
+        for sess in ram:
+            sess["bytes"] = sess["slots"] * slot_bytes
+        for group in (gpu, ram, ssd):
+            for sess in group:
+                sess["last_used"] = _epoch(sess["last_used"])
+
+        kv_transfer = self.vllm_config.kv_transfer_config
+        cpu_bytes = None
+        if kv_transfer is not None:
+            cpu_bytes = kv_transfer.kv_connector_extra_config.get(
+                "cpu_bytes_to_use"
+            )
+        store = self._ssd_store
+        config = {
+            "pid": os.getpid(),
+            "model": self.vllm_config.model_config.model,
+            "max_model_len": self.vllm_config.model_config.max_model_len,
+            "max_num_seqs": self.vllm_config.scheduler_config.max_num_seqs,
+            "kv_cache_bytes": self.vllm_config.cache_config.kv_cache_memory_bytes,
+            "block_size": self.block_size,
+            "gpu_total_tokens": gpu_total_tokens,
+            "staging_slots": kvm.ram_capacity(),
+            "chunk_slots": self._ssd_chunk_slots,
+            "cpu_bytes": cpu_bytes,
+            "pin_min_tokens": envs.VLLM_PIN_MIN_TOKENS,
+            "ckpt_tokens": envs.VLLM_MAMBA_CKPT_TOKENS,
+            "ckpt_anchors": envs.VLLM_MAMBA_CKPT_ANCHORS,
+            "evict_small_tokens": envs.VLLM_HOSTTIER_EVICT_SMALL_TOKENS,
+            "ram_slot_bytes": slot_bytes,
+            "page_bytes": page_bytes,
+            "ssd": {
+                "enabled": store is not None,
+                "root": envs.VLLM_SSD_ROOT,
+                "quota_bytes": (
+                    store.quota_bytes if store is not None else None
+                ),
+                "max_mbps": envs.VLLM_SSD_MAX_MBPS,
+                "only": envs.VLLM_SSD_ONLY,
+                "clean_start": envs.VLLM_SSD_CLEAN_START,
+                "row_bytes": store.row_bytes if store is not None else 0,
+            },
+        }
+        return {
+            "ts": now_wall,
+            "config": config,
+            "sessions": {"gpu": gpu, "ram": ram, "ssd": ssd},
+        }
+
+    def _ram_slot_bytes(self) -> int:
+        """Bytes per host-tier CPU slot (0 when unavailable)."""
+        get = getattr(self.connector, "cpu_slot_bytes", None)
+        if get is None:
+            return 0
+        try:
+            return int(get())
+        except Exception:
+            return 0
+
     def make_spec_decoding_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None,
@@ -3047,7 +3135,12 @@ class Scheduler(SchedulerInterface):
             self._host_tier_evictions += evicted
             self._host_tier_ssd_evictions += evicted
         if not self._ssd_store.begin_store(
-            req_id, len(flat), grp_hashes, entry["tail"], entry["tokens"]
+            req_id,
+            len(flat),
+            grp_hashes,
+            entry["tail"],
+            entry["tokens"],
+            entry.get("anchors", 0),
         ):
             kvm.abort_spill(req_id)
             self._host_tier_drops += 1
