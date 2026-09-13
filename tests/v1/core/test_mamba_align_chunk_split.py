@@ -252,6 +252,37 @@ def test_durable_boundaries_survive_head_free(
     assert blocks[0].is_null and blocks[1].is_null
 
 
+def test_durable_window_retires_lowest_token_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-shot head-free must retire the oldest anchors, not the newest.
+
+    The head-prefix free walks blocks high->low, so retiring by insertion order
+    kept the oldest boundaries (1600..9600) and dropped the near-tail ones a
+    revert needs; a restored 515k session reproduced exactly that.
+    """
+    from vllm import envs
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+    monkeypatch.setattr(envs, "VLLM_MAMBA_CKPT_TOKENS", 2 * MAMBA_BLOCK_SIZE)
+    manager = _make_hybrid_kv_cache_manager()
+    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+    # Policy test: the window list is what matters, not the pool bookkeeping.
+    monkeypatch.setattr(mamba.block_pool, "pin_block", lambda blk: None)
+    monkeypatch.setattr(mamba.block_pool, "unpin_block", lambda blk: None)
+    monkeypatch.setattr(mamba.block_pool, "free_blocks", lambda blocks: None)
+
+    # Retain boundaries in the order a one-shot head-free visits them.
+    for end in range(10 * MAMBA_BLOCK_SIZE, 0, -MAMBA_BLOCK_SIZE):
+        blk = KVCacheBlock(block_id=end)
+        blk._block_hash_num_tokens = end
+        mamba._retain_durable_anchor("r", blk)
+
+    kept = sorted(b.block_hash_num_tokens for b in mamba._durable_win["r"])
+    # Cap 6 (ANCHORS=3, doubled): the six highest boundaries survive.
+    assert kept == [8000, 9600, 11200, 12800, 14400, 16000]
+
+
 def test_align_ckpt_tokens_floors_to_block_size() -> None:
     from vllm.v1.core.kv_cache_utils import align_ckpt_tokens
 

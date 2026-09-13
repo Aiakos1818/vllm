@@ -1567,16 +1567,34 @@ class MambaManager(SingleTypeKVCacheManager):
         self, request_id: str, blk: KVCacheBlock
     ) -> None:
         """Pin ``blk`` and hand it to this request's durable window (newest
-        last), retiring the oldest anchor past the cap. No-op if the block is
-        already in the window (avoids a duplicate unpin at finish)."""
+        last), retiring the anchor with the lowest token position past the cap.
+        No-op if the block is already in the window (avoids a duplicate unpin
+        at finish)."""
         win = self._durable_win.setdefault(request_id, [])
         if any(b is blk for b in win):
             return
         self.block_pool.pin_block(blk)
         win.append(blk)
+        if envs.RAMTRACE:
+            try:
+                with open(envs.RAMTRACE_LOG, "a") as _f:
+                    _f.write(
+                        f"retain anchor req={request_id} "
+                        f"tok={blk.block_hash_num_tokens} win={len(win)}\n"
+                    )
+            except Exception:
+                pass
         if len(win) > self._ckpt_anchors:
-            oldest = win.pop(0)
-            self._release_durable_anchor(oldest)
+            # Retire by token position, not insertion order: a one-shot
+            # head-prefix free walks blocks high->low, so dropping the first
+            # inserted would keep the oldest boundaries and discard the
+            # near-tail ones a revert needs (e.g. a restored 515k session kept
+            # 30400..96000 instead of ~448k..512k).
+            idx = min(
+                range(len(win)),
+                key=lambda i: win[i].block_hash_num_tokens or 0,
+            )
+            self._release_durable_anchor(win.pop(idx))
 
     def take_durable_window(self, request_id: str) -> list[KVCacheBlock]:
         """Hand over this request's surviving durable anchors to the caller
@@ -1590,7 +1608,17 @@ class MambaManager(SingleTypeKVCacheManager):
         """
         if self.mamba_cache_mode != "align" or not self._ckpt_tokens:
             return []
-        return self._durable_win.pop(request_id, [])
+        win = self._durable_win.pop(request_id, [])
+        if envs.RAMTRACE and win:
+            try:
+                with open(envs.RAMTRACE_LOG, "a") as _f:
+                    _f.write(
+                        f"durable window req={request_id} "
+                        f"anchors={[b.block_hash_num_tokens for b in win]}\n"
+                    )
+            except Exception:
+                pass
+        return win
 
     def _adopt_cached_durable_anchors(
         self, request: Request, num_tokens: int
