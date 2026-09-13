@@ -1313,11 +1313,10 @@ class MambaManager(SingleTypeKVCacheManager):
             # one so the net in-flight footprint of this request stays flat.
             # That bounded footprint is what prevents the ~1.04x-concurrency
             # pool from being drained mid-prefill (which previously deadlocked
-            # a single long prefill at small cadences). Each cadence now keeps
-            # two anchors (``cadence`` and ``cadence - block_size``), so the
-            # cap is doubled to keep ``VLLM_MAMBA_CKPT_ANCHORS`` meaning
-            # "cadences of near-tail coverage".
-            self._ckpt_anchors = max(1, envs.VLLM_MAMBA_CKPT_ANCHORS) * 2
+            # a single long prefill at small cadences). Each cadence keeps a
+            # single anchor (``cadence - block_size``; see ``_is_durable_boundary``),
+            # so the cap equals ``VLLM_MAMBA_CKPT_ANCHORS`` cadences of coverage.
+            self._ckpt_anchors = max(1, envs.VLLM_MAMBA_CKPT_ANCHORS)
             self._durable_win: dict[str, list[KVCacheBlock]] = {}
             # Requests whose cached durable anchors were already re-claimed
             # from the prefix cache (once per request, on its first cache call
@@ -1552,16 +1551,18 @@ class MambaManager(SingleTypeKVCacheManager):
         self.block_pool.free_blocks([blk])
 
     def _is_durable_boundary(self, end_tokens: int) -> bool:
-        """True at a durable snapshot boundary: the cadence itself, or one
-        block before it (MTP sets ``use_eagle``, so the full-attention finder
-        drops one block and a truncation at ``cadence`` needs the state at
-        ``cadence - block_size``)."""
+        """True at a durable snapshot boundary: one block before the cadence.
+
+        MTP sets ``use_eagle``, so the full-attention finder drops the last
+        matching block: a request that would reuse the state at ``cadence`` is
+        reconciled down to ``cadence - block_size``. Retaining only that
+        pre-cadence block therefore covers both the eagle-dropped and the plain
+        lookup (the latter reconciles down too), halving the anchor footprint
+        versus also pinning the ``cadence`` block.
+        """
         if not self._ckpt_tokens:
             return False
-        return (
-            end_tokens % self._ckpt_tokens == 0
-            or (end_tokens + self.block_size) % self._ckpt_tokens == 0
-        )
+        return (end_tokens + self.block_size) % self._ckpt_tokens == 0
 
     def _retain_durable_anchor(
         self, request_id: str, blk: KVCacheBlock

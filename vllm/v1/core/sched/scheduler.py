@@ -525,9 +525,9 @@ class Scheduler(SchedulerInterface):
         # MTP (speculative decoding) makes the full-attention finder drop one
         # block (`use_eagle`), so a request that would reuse the cadence anchor
         # at ``cadence`` is reconciled down to ``cadence - block_size`` and needs
-        # an SSM state exactly there. Materialize that pre-cadence boundary too
-        # (it is retained as a durable anchor by the MambaManager) so both the
-        # eagle-dropped and the plain lookup can reuse an anchor.
+        # an SSM state exactly there. Materialize that pre-cadence boundary (it
+        # is the durable anchor the MambaManager retains); the plain lookup
+        # reconciles down to it as well.
         pre_ckpt = 0
         if next_ckpt and next_ckpt - block_size > 0:
             pre_ckpt = next_ckpt - block_size

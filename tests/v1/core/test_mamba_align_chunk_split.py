@@ -244,7 +244,6 @@ def test_durable_boundaries_survive_head_free(
     win = mamba.take_durable_window(request.request_id)
     assert sorted(b.block_hash_num_tokens for b in win) == [
         MAMBA_BLOCK_SIZE,
-        2 * MAMBA_BLOCK_SIZE,
     ]
     assert all(b.pinned for b in win)
     # The retained entries are detached from the table like any freed block.
@@ -279,8 +278,32 @@ def test_durable_window_retires_lowest_token_anchor(
         mamba._retain_durable_anchor("r", blk)
 
     kept = sorted(b.block_hash_num_tokens for b in mamba._durable_win["r"])
-    # Cap 6 (ANCHORS=3, doubled): the six highest boundaries survive.
-    assert kept == [8000, 9600, 11200, 12800, 14400, 16000]
+    # Cap 3 (ANCHORS=3, one anchor per cadence): the three highest survive.
+    assert kept == [12800, 14400, 16000]
+
+
+def test_only_pre_cadence_is_durable_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each cadence retains one anchor at `cadence - block_size`, not two.
+
+    MTP makes the full-attention finder drop a block, so reusing the cadence
+    reconciles down to the pre-cadence anchor; the cadence block itself is not
+    durable. Retaining one anchor per cadence halves the pinned footprint
+    (the pool headroom a deep revert needs).
+    """
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_MAMBA_CKPT_TOKENS", 4 * MAMBA_BLOCK_SIZE)
+    manager = _make_hybrid_kv_cache_manager()
+    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+
+    b = MAMBA_BLOCK_SIZE
+    assert mamba._is_durable_boundary(3 * b)  # cadence 4b - b
+    assert not mamba._is_durable_boundary(4 * b)  # the cadence itself
+    assert mamba._is_durable_boundary(7 * b)  # next pre-cadence
+    assert not mamba._is_durable_boundary(2 * b)
+    assert mamba._ckpt_anchors == 3
 
 
 def test_align_ckpt_tokens_floors_to_block_size() -> None:
@@ -356,7 +379,6 @@ def test_resumed_session_reclaims_cached_anchors(
     anchors = mamba.take_durable_window(producer.request_id)
     assert sorted(b.block_hash_num_tokens for b in anchors) == [
         MAMBA_BLOCK_SIZE,
-        2 * MAMBA_BLOCK_SIZE,
     ]
     # The session goes to the host tier and comes back: its anchors are
     # re-loaded as ordinary idle cached blocks (hash kept, no owner).
