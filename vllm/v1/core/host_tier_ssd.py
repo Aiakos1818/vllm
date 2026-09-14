@@ -319,11 +319,15 @@ class HostTierSSDStore:
         tail: bytes | None,
         tokens: int,
         anchors: int = 0,
+        last_used: float | None = None,
     ) -> bool:
         """Reserve quota for a session that will be written in chunks.
 
         Returns False when the session can never fit the quota or no space
         could be freed (caller runs ``evict_for`` first).
+
+        ``last_used`` carries the chain's true last-use time from the GPU tier;
+        eviction must not refresh it. Falls back to now when unknown.
         """
         total_bytes = total_slots * self._row_bytes
         if total_slots <= 0 or total_bytes > self._quota:
@@ -363,7 +367,9 @@ class HostTierSSDStore:
             "bytes": total_bytes,
             "anchors": int(anchors),
             "dir": directory,
-            "last_used": time.monotonic(),
+            "last_used": (
+                last_used if last_used is not None else time.monotonic()
+            ),
         }
         with self._lock:
             self._reserved_bytes += total_bytes
@@ -420,9 +426,12 @@ class HostTierSSDStore:
         grp_hashes: list[list[bytes]],
         tail: bytes | None,
         tokens: int,
+        last_used: float | None = None,
     ) -> int | None:
         """Whole-session store (single chunk) used by tests/small sessions."""
-        if not self.begin_store(sid, len(slots), grp_hashes, tail, tokens):
+        if not self.begin_store(
+            sid, len(slots), grp_hashes, tail, tokens, last_used=last_used
+        ):
             return None
         job_id = self.append_store(sid, 0, slots, commit=True)
         if job_id is None:
@@ -530,8 +539,9 @@ class HostTierSSDStore:
                 with self._lock:
                     self._pending_bytes -= nbytes
                     if success and commit and meta is not None:
+                        # Keep the last-use time carried by ``begin_store``:
+                        # committing the store is not a use.
                         session = dict(meta)
-                        session["last_used"] = time.monotonic()
                         self._sessions[sid] = session
                         self._bytes_used += meta["bytes"]
                         self._reserved_bytes -= meta["bytes"]

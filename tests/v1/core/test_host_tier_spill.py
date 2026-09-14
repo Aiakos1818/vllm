@@ -230,6 +230,7 @@ def test_confirm_spill_parks_metadata_without_blocks() -> None:
         "tokens": 8,
         "num_blocks": 2,
         "anchors": 3,
+        "last_used": 42.0,
         "blocks": [],
         "grp_blocks": [[block]],
     }
@@ -241,6 +242,8 @@ def test_confirm_spill_parks_metadata_without_blocks() -> None:
     assert session["grp_hashes"] == [[b"tailhash"]]
     assert session["tokens"] == 8
     assert session["anchors"] == 3
+    # Parking must not refresh last_used: eviction is not a use.
+    assert session["last_used"] == 42.0
     assert "r" not in manager._spill_hold
 
 

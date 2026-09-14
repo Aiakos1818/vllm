@@ -1118,7 +1118,11 @@ class KVCacheManager:
             "anchors": entry.get("anchors", 0),
             "slots": slots or [],
             "parked_at": time.monotonic(),
-            "last_used": time.monotonic(),
+            # Eviction is not a use: keep the chain's true last-use time so the
+            # host-tier LRU order is not perturbed by the spill itself.
+            "last_used": entry.get(
+                "last_used", entry.get("parked_at", time.monotonic())
+            ),
         }
         if envs.RAMTRACE:
             try:

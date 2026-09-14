@@ -372,7 +372,9 @@ def test_begin_store_records_anchors_and_snapshot(tmp_path) -> None:
     """The parked session keeps its anchor count for the monitor snapshot."""
     buf, view, flat = make_view(8)
     store = make_store(tmp_path, view)
-    assert store.begin_store("sidA", 3, [[b"\x01" * 16]], tail(0xAA), 96, 2)
+    assert store.begin_store(
+        "sidA", 3, [[b"\x01" * 16]], tail(0xAA), 96, 2, last_used=42.0
+    )
     assert store.append_store("sidA", 0, [0, 1, 2], commit=True) is not None
     wait_n(store, 1)
 
@@ -382,7 +384,8 @@ def test_begin_store_records_anchors_and_snapshot(tmp_path) -> None:
     assert sess["blocks"] == 3
     assert sess["bytes"] == 3 * ROW
     assert sess["anchors"] == 2
-    assert "last_used" in sess
+    # Neither beginning nor committing the store may refresh last_used.
+    assert sess["last_used"] == 42.0
 
     store.shutdown()
     close_view(buf, view, flat)

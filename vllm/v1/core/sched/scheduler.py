@@ -3141,6 +3141,7 @@ class Scheduler(SchedulerInterface):
             entry["tail"],
             entry["tokens"],
             entry.get("anchors", 0),
+            last_used=entry.get("last_used"),
         ):
             kvm.abort_spill(req_id)
             self._host_tier_drops += 1
