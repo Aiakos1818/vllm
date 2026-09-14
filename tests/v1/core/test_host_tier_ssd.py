@@ -379,7 +379,7 @@ def test_begin_store_records_anchors_and_snapshot(tmp_path) -> None:
     wait_n(store, 1)
 
     [sess] = store.snapshot()
-    assert sess["sid"] == "sidA"
+    assert sess["id"] == "sidA"
     assert sess["tokens"] == 96
     assert sess["blocks"] == 3
     assert sess["bytes"] == 3 * ROW

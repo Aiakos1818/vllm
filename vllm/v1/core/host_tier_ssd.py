@@ -182,7 +182,7 @@ class HostTierSSDStore:
         with self._lock:
             return [
                 {
-                    "sid": s["sid"],
+                    "id": s.get("req_id", s["sid"]),
                     "tokens": s["tokens"],
                     "blocks": s["n_slots"],
                     "bytes": s["bytes"],
