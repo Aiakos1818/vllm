@@ -47,6 +47,8 @@ if TYPE_CHECKING:
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+    VLLM_QWOPUS_MTP_BF16_DRAFT: bool = False
+    VLLM_SM75_SPEC_SYNC_MODE: str = "auto"
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -859,6 +861,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
         else True
     ),
+    # Local Qwopus/Qwen3.5 MTP draft compatibility switch.
+    "VLLM_QWOPUS_MTP_BF16_DRAFT": lambda: bool(
+        int(os.getenv("VLLM_QWOPUS_MTP_BF16_DRAFT", "0"))
+    ),
+    # 2080Ti/SM75 local policy for speculative decode stream syncs.
+    # auto: keep syncs for TurboQuant KV safety; safe: always sync; nosync: skip.
+    "VLLM_SM75_SPEC_SYNC_MODE": lambda: (
+        env_with_choices(
+            "VLLM_SM75_SPEC_SYNC_MODE", "auto", ["auto", "safe", "nosync"], False
+        )()
+        or "auto"
+    ).lower(),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
     # (CPU backend only) CPU key-value cache space.
