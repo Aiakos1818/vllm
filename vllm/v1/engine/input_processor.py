@@ -112,14 +112,26 @@ class InputProcessor:
                         "bound sampling mask size, reduce transfer overhead, "
                         "and avoid potential OOMs"
                     )
-            if params.thinking_token_budget is not None and (
-                self.vllm_config.reasoning_config is None
-                or not self.vllm_config.reasoning_config.enabled
+            if params.thinking_token_budget is not None:
+                if (
+                    self.vllm_config.reasoning_config is None
+                    or not self.vllm_config.reasoning_config.enabled
+                ):
+                    raise VLLMValidationError(
+                        "thinking_token_budget is set but reasoning_config is "
+                        "not configured. Please set --reasoning-parser "
+                        "and/or --reasoning-config to use thinking_token_budget."
+                    )
+            elif (
+                self.vllm_config.reasoning_config is not None
+                and self.vllm_config.reasoning_config.enabled
+                and self.vllm_config.reasoning_config.default_thinking_token_budget
+                is not None
             ):
-                raise VLLMValidationError(
-                    "thinking_token_budget is set but reasoning_config is "
-                    "not configured. Please set --reasoning-parser "
-                    "and/or --reasoning-config to use thinking_token_budget."
+                # Local default: apply the server-side thinking budget when the
+                # request did not set one explicitly.
+                params.thinking_token_budget = (
+                    self.vllm_config.reasoning_config.default_thinking_token_budget
                 )
             if (
                 params.trace_decode_token_ids

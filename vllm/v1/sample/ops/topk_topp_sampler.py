@@ -104,10 +104,24 @@ def flashinfer_sampler_supported() -> bool:
     capability = current_platform.get_device_capability()
     assert capability is not None
     unsupported_reason: str | None = None
-    if not FlashInferBackend.supports_compute_capability(capability):
-        unsupported_reason = (
-            f"unsupported compute capability {capability.as_version_str()}"
-        )
+    if not FlashInferBackend.supports_compute_capability(
+        capability
+    ) or (capability.major == 7 and capability.minor >= 5):
+        # Local SM75/2080 Ti override: the pinned FlashInfer runtime is validated
+        # for top-p/top-k sampling on Turing, even though the generic attention
+        # backend gate is stricter than this sampler path needs. The override also
+        # skips the FlashInfer JIT probe below, which that gate would have reached.
+        if capability.major == 7 and capability.minor >= 5:
+            logger.info_once(
+                "Using FlashInfer top-p/top-k sampling on local SM75 override "
+                "(compute capability %s).",
+                capability.as_version_str(),
+                scope="global",
+            )
+        else:
+            unsupported_reason = (
+                f"unsupported compute capability {capability.as_version_str()}"
+            )
     else:
         unsupported_reason = _flashinfer_jit_unsupported_reason(capability)
 
