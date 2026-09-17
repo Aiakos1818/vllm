@@ -12,13 +12,19 @@ Load path:
 
 File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
               (hash-based subdirectories to limit directory fan-out)
+
+Byte budget:
+    With ``max_bytes`` set, the tier keeps its own disk usage under that bound
+    by evicting whole block files, least recently used first (see quota.py).
+    Without it the tier grows without bound, as upstream does.
 """
 
+import errno
 import functools
 import json
 import os
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 try:
     from vllm.fs_io_C import batch_lookup as batch_lookup_C
@@ -29,12 +35,18 @@ except ImportError:
 
 from typing_extensions import override
 
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
     Medium,
+    OffloadingCounterMetadata,
     OffloadingEvent,
+    OffloadingGaugeMetadata,
+    OffloadingMetricMetadata,
     OffloadKey,
     ReqContext,
 )
@@ -54,12 +66,22 @@ from vllm.v1.kv_offload.tiering.fs.io import (
     batch_store_block,
     probe_o_direct,
 )
+from vllm.v1.kv_offload.tiering.fs.quota import FileQuota
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
 
 logger = init_logger(__name__)
+
+# Errnos a full disk can surface as: ENOSPC on a regular filesystem, EDQUOT
+# when a quota is hit, and EIO on tmpfs.
+_FULL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EIO})
+
+_EVICTIONS_METRIC = "vllm:kv_offload_tiering_fs_evictions"
+_EVICTED_BYTES_METRIC = "vllm:kv_offload_tiering_fs_evicted_bytes"
+_SKIPPED_BYTES_METRIC = "vllm:kv_offload_tiering_fs_skipped_store_bytes"
+_USED_BYTES_METRIC = "vllm:kv_offload_tiering_fs_used_bytes"
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -102,6 +124,14 @@ class FileSystemTierManager(SecondaryTierManager):
         variable to the same value on all instances overrides the default seed,
         and is required to share a cache when using a non-cryptographic
         prefix-caching hash algorithm, which seeds ``NONE_HASH`` randomly.
+
+    Byte budget:
+        With ``max_bytes`` set, the tier keeps its disk usage under that bound
+        by evicting whole block files, least recently used first (see
+        quota.py). Without it the directory grows without bound, as upstream
+        does. A budget assumes the tier owns the directory: an instance
+        evicting blocks it did not write cannot tell which ones other
+        instances are still using.
     """
 
     medium: ClassVar[Medium] = Medium.STORAGE
@@ -117,6 +147,8 @@ class FileSystemTierManager(SecondaryTierManager):
         enable_kv_events: bool = False,
         locality: str | None = None,
         backpressure_detector: BackpressureDetector | None = None,
+        max_bytes: int = 0,
+        evict_retries: int = 3,
     ):
         """Args:
         offloading_spec: Contains normalized offloading configuration and
@@ -132,6 +164,11 @@ class FileSystemTierManager(SecondaryTierManager):
         locality: Whether this tier's storage is LOCAL or REMOTE relative
             to the publishing vLLM instance.
         backpressure_detector: Optional backpressure detector.
+        max_bytes: Upper bound on the bytes this tier may hold on disk. Blocks
+            are evicted least recently used first to stay under it. 0 keeps
+            the upstream behavior of never evicting.
+        evict_retries: How many times a store may evict and retry after
+            failing with a full-disk errno. Only used with ``max_bytes``.
 
         """
         super().__init__(
@@ -208,6 +245,63 @@ class FileSystemTierManager(SecondaryTierManager):
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
+        # Byte budget over the block files, and the paths of blocks an
+        # in-flight load is about to read (never evicted).
+        self._evict_retries = evict_retries
+        self._pinned_paths: set[str] = set()
+        self._quota: FileQuota | None = None
+        if max_bytes > 0:
+            self._quota = FileQuota(
+                root_dir=self.file_mapper.get_rank_root(), max_bytes=int(max_bytes)
+            )
+            logger.info(
+                "Disk tier '%s' byte budget: %.2f GiB over '%s' (%d blocks held)",
+                self.tier_type,
+                max_bytes / 2**30,
+                self._quota.root_dir,
+                self._quota.num_files,
+            )
+
+    @classmethod
+    @override
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, OffloadingMetricMetadata]:
+        if not extra_config.get("max_bytes"):
+            return {}
+        return {
+            _EVICTIONS_METRIC: OffloadingCounterMetadata(
+                documentation="KV blocks evicted from the disk tier."
+            ),
+            _EVICTED_BYTES_METRIC: OffloadingCounterMetadata(
+                documentation="Bytes reclaimed by disk-tier evictions."
+            ),
+            _SKIPPED_BYTES_METRIC: OffloadingCounterMetadata(
+                documentation=(
+                    "Store bytes dropped because the disk-tier byte budget "
+                    "could not fit them."
+                )
+            ),
+            _USED_BYTES_METRIC: OffloadingGaugeMetadata(
+                documentation="Bytes the disk tier currently holds."
+            ),
+        }
+
+    @override
+    def get_stats(self) -> OffloadingConnectorStats | None:
+        if self._quota is None:
+            return None
+        evictions, evicted_bytes, skipped_bytes = self._quota.take_counters()
+        stats = OffloadingConnectorStats()
+        if evictions:
+            stats.increase_counter(_EVICTIONS_METRIC, evictions)
+        if evicted_bytes:
+            stats.increase_counter(_EVICTED_BYTES_METRIC, evicted_bytes)
+        if skipped_bytes:
+            stats.increase_counter(_SKIPPED_BYTES_METRIC, skipped_bytes)
+        stats.set_gauge(_USED_BYTES_METRIC, self._quota.used_bytes)
+        return stats
+
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
@@ -224,16 +318,71 @@ class FileSystemTierManager(SecondaryTierManager):
         keys = list(job_metadata.keys)
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = keys
-        task = functools.partial(
-            batch_store_block,
-            [self.file_mapper.get_file_name(key) for key in keys],
-            self._primary_kv_view,
-            [int(cid) * self._block_size for cid in job_metadata.chunk_ids],
-            self._block_size,
-            self._use_o_direct,
-        )
         self._job_block_counts[job_metadata.job_id] = len(keys)
+        paths = [self.file_mapper.get_file_name(key) for key in keys]
+        offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
+        if self._quota is None:
+            task = functools.partial(
+                batch_store_block,
+                paths,
+                self._primary_kv_view,
+                offsets,
+                self._block_size,
+                self._use_o_direct,
+            )
+        else:
+            task = functools.partial(self._store_batch, paths, offsets)
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])
+
+    def _store_batch(self, paths: list[str], offsets: list[int]) -> None:
+        """Store a batch within the byte budget.
+
+        Runs on a pool thread: reserves room (evicting least recently used
+        blocks), writes, then accounts for what actually landed. A write that
+        hits a full disk despite the budget (shared filesystem) evicts more and
+        retries a bounded number of times.
+        """
+        assert self._quota is not None
+        assert not paths or len(paths) == len(offsets)
+        reserved = self._quota.reserve(paths, self._block_size, self._pinned_paths)
+        if reserved is None:
+            logger.warning_once(
+                "Disk tier byte budget (%d bytes) is smaller than one store "
+                "batch; offloading is effectively disabled.",
+                self._quota.max_bytes,
+            )
+            return
+        try:
+            attempts = self._evict_retries + 1
+            while True:
+                try:
+                    batch_store_block(
+                        paths,
+                        self._primary_kv_view,
+                        offsets,
+                        self._block_size,
+                        self._use_o_direct,
+                    )
+                    return
+                except OSError as exc:
+                    attempts -= 1
+                    if attempts <= 0 or exc.errno not in _FULL_ERRNOS:
+                        raise
+                    evicted = self._quota.evict_bytes(
+                        max(reserved, self._block_size), self._pinned_paths
+                    )
+                    if evicted == 0:
+                        raise
+                    logger.warning(
+                        "Store of %d block(s) failed (%s); evicted %.2f GiB "
+                        "and retrying",
+                        len(paths),
+                        exc,
+                        evicted / 2**30,
+                    )
+        finally:
+            # Counts blocks that made it, including a partial batch.
+            self._quota.commit(paths, reserved)
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
@@ -245,6 +394,8 @@ class FileSystemTierManager(SecondaryTierManager):
         self._job_block_counts[job_id] = len(keys)
         paths = [self.file_mapper.get_file_name(key) for key in keys]
         offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
+        # Blocks an in-flight load may still open must survive eviction.
+        self._pinned_paths.update(paths)
 
         def load_task() -> None:
             try:
@@ -272,6 +423,8 @@ class FileSystemTierManager(SecondaryTierManager):
                     exc,
                 )
                 raise
+            if self._quota is not None:
+                self._quota.touch(paths)
 
         self._pool.enqueue_load(job_id, 1, [load_task])
 
@@ -296,6 +449,11 @@ class FileSystemTierManager(SecondaryTierManager):
                     )
             load_keys = self._load_job_keys.pop(job_id, None)
             num_succeeded = self._load_progress.pop(job_id, 0)
+            if load_keys is not None:
+                # The load is done reading, so these blocks are evictable.
+                self._pinned_paths.difference_update(
+                    self.file_mapper.get_file_name(key) for key in load_keys
+                )
             if load_keys is not None and not success:
                 # A batched load stops at the first bad block and reports how
                 # many loaded before it. Those earlier blocks are kept in the

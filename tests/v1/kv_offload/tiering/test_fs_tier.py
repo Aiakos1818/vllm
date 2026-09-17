@@ -7,6 +7,7 @@ The tier manager writes KV cache blocks to disk and reads them back, verifying
 data integrity throughout the process.
 """
 
+import errno
 import mmap
 import os
 import threading
@@ -968,3 +969,210 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         assert torch.allclose(reader_tensor[1], expected)
     finally:
         reader.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Byte budget (max_bytes)
+# ---------------------------------------------------------------------------
+
+# One float32 block of _BLOCK_ELEMENTS elements.
+_BLOCK_BYTES = _BLOCK_ELEMENTS * 4
+
+
+def _budget_tier(root, max_bytes: int) -> FileSystemTierManager:
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    return FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(root),
+        n_read_threads=2,
+        n_write_threads=2,
+        max_bytes=max_bytes,
+    )
+
+
+def _store_batch(tier, job_id, keys, chunk_ids=None) -> list:
+    tier.submit_store(make_job(job_id, keys, chunk_ids))
+    results = drain(tier)
+    # Distinct store times keep the eviction order deterministic.
+    time.sleep(0.005)
+    return results
+
+
+def test_budget_evicts_least_recently_used_block(tmp_path):
+    """A store past the budget evicts the oldest block, and only that one."""
+    tier = _budget_tier(tmp_path, 2 * _BLOCK_BYTES)
+    try:
+        for job_id, k, cid in ((1, 1, 0), (2, 2, 1), (3, 3, 2)):
+            assert all(r.success for r in _store_batch(tier, job_id, [key(k)], [cid]))
+
+        assert lookup_and_wait(tier, [key(1)]) == [LookupResult.MISS]
+        assert lookup_and_wait(tier, [key(2), key(3)]) == [
+            LookupResult.HIT,
+            LookupResult.HIT,
+        ]
+        assert tier._quota.used_bytes == 2 * _BLOCK_BYTES
+        assert tier._quota.num_files == 2
+    finally:
+        tier.shutdown()
+
+
+def test_budget_keeps_recently_restored_block(tmp_path):
+    """LRU: a restored block outlives blocks stored after it."""
+    tier = _budget_tier(tmp_path, 2 * _BLOCK_BYTES)
+    try:
+        _store_batch(tier, 1, [key(1)], [0])
+        _store_batch(tier, 2, [key(2)], [1])
+
+        # Restoring key(1) makes it the most recently used block.
+        tier.submit_load(make_job(3, [key(1)], [2], is_promotion=True))
+        assert all(r.success for r in drain(tier))
+        assert os.path.exists(tier.file_mapper.get_file_name(key(1)))
+
+        _store_batch(tier, 4, [key(3)], [3])
+        assert lookup_and_wait(tier, [key(1)]) == [LookupResult.HIT]
+        assert lookup_and_wait(tier, [key(3)]) == [LookupResult.HIT]
+        assert lookup_and_wait(tier, [key(2)]) == [LookupResult.MISS]
+    finally:
+        tier.shutdown()
+
+
+def test_budget_skips_batch_larger_than_budget(tmp_path):
+    """A batch that cannot fit is dropped without failing its job."""
+    tier = _budget_tier(tmp_path, _BLOCK_BYTES)
+    try:
+        results = _store_batch(tier, 1, [key(1), key(2)], [0, 1])
+        assert all(r.success for r in results)
+        assert lookup_and_wait(tier, [key(1), key(2)]) == [
+            LookupResult.MISS,
+            LookupResult.MISS,
+        ]
+        assert tier._quota.used_bytes == 0
+        _, _, skipped_bytes = tier._quota.take_counters()
+        assert skipped_bytes == 2 * _BLOCK_BYTES
+    finally:
+        tier.shutdown()
+
+
+def test_budget_does_not_double_count_restored_block(tmp_path):
+    """Re-storing a block already on disk evicts nothing."""
+    tier = _budget_tier(tmp_path, 2 * _BLOCK_BYTES)
+    try:
+        _store_batch(tier, 1, [key(1)], [0])
+        _store_batch(tier, 2, [key(2)], [1])
+        _store_batch(tier, 3, [key(1)], [0])
+
+        assert tier._quota.used_bytes == 2 * _BLOCK_BYTES
+        assert lookup_and_wait(tier, [key(1), key(2)]) == [
+            LookupResult.HIT,
+            LookupResult.HIT,
+        ]
+    finally:
+        tier.shutdown()
+
+
+def test_budget_scans_existing_blocks_on_startup(tmp_path):
+    """A restart resumes with the blocks and mtimes already on disk."""
+    plain = _budget_tier(tmp_path, 0)
+    try:
+        for job_id, k, cid in ((1, 1, 0), (2, 2, 1), (3, 3, 2)):
+            _store_batch(plain, job_id, [key(k)], [cid])
+        assert plain._quota is None
+        assert plain.get_stats() is None
+    finally:
+        plain.shutdown()
+
+    tier = _budget_tier(tmp_path, 2 * _BLOCK_BYTES)
+    try:
+        assert tier._quota.num_files == 3
+        assert tier._quota.used_bytes == 3 * _BLOCK_BYTES
+
+        _store_batch(tier, 9, [key(4)], [3])
+        assert lookup_and_wait(tier, [key(1), key(2)]) == [
+            LookupResult.MISS,
+            LookupResult.MISS,
+        ]
+        assert lookup_and_wait(tier, [key(3), key(4)]) == [
+            LookupResult.HIT,
+            LookupResult.HIT,
+        ]
+    finally:
+        tier.shutdown()
+
+
+def test_budget_drops_orphaned_temp_files(tmp_path):
+    """Temp files left by a killed process are reclaimed on startup."""
+    helper = _budget_tier(tmp_path, 0)
+    rank_root = helper.file_mapper.get_rank_root()
+    helper.shutdown()
+
+    os.makedirs(rank_root, exist_ok=True)
+    orphan = os.path.join(rank_root, "deadbeef.tmp")
+    with open(orphan, "w") as f:
+        f.write("partial write from a killed process")
+
+    tier = _budget_tier(tmp_path, 2 * _BLOCK_BYTES)
+    try:
+        assert not os.path.exists(orphan)
+        assert tier._quota.num_files == 0
+        assert tier._quota.used_bytes == 0
+    finally:
+        tier.shutdown()
+
+
+def test_budget_retries_store_when_disk_is_full(tmp_path, monkeypatch):
+    """A full-disk errno evicts more and retries the batch."""
+    from vllm.v1.kv_offload.tiering.fs import manager as fs_manager
+
+    tier = _budget_tier(tmp_path, 2 * _BLOCK_BYTES)
+    try:
+        _store_batch(tier, 1, [key(1)], [0])
+        _store_batch(tier, 2, [key(2)], [1])
+
+        real_store = fs_manager.batch_store_block
+        calls: list[int] = []
+
+        def flaky_store(paths, *args, **kwargs):
+            calls.append(len(paths))
+            if len(calls) == 1:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_store(paths, *args, **kwargs)
+
+        monkeypatch.setattr(fs_manager, "batch_store_block", flaky_store)
+        results = _store_batch(tier, 3, [key(3)], [2])
+
+        assert all(r.success for r in results), [r.success for r in results]
+        assert calls == [1, 1], "expected one failed attempt and one retry"
+        assert lookup_and_wait(tier, [key(3)]) == [LookupResult.HIT]
+        assert lookup_and_wait(tier, [key(1), key(2)]) == [
+            LookupResult.MISS,
+            LookupResult.MISS,
+        ]
+    finally:
+        tier.shutdown()
+
+
+def test_budget_metrics(tmp_path):
+    """Evictions and usage are reported through get_stats."""
+    assert FileSystemTierManager.build_metric_definitions({}) == {}
+    definitions = FileSystemTierManager.build_metric_definitions({"max_bytes": 1024})
+    assert "vllm:kv_offload_tiering_fs_evictions" in definitions
+    assert "vllm:kv_offload_tiering_fs_used_bytes" in definitions
+
+    tier = _budget_tier(tmp_path, 2 * _BLOCK_BYTES)
+    try:
+        for job_id, k, cid in ((1, 1, 0), (2, 2, 1), (3, 3, 2)):
+            _store_batch(tier, job_id, [key(k)], [cid])
+
+        stats = tier.get_stats()
+        assert stats is not None
+        reduced = stats.reduce()
+        assert reduced["vllm:kv_offload_tiering_fs_evictions"] == 1
+        assert reduced["vllm:kv_offload_tiering_fs_evicted_bytes"] == _BLOCK_BYTES
+        assert reduced["vllm:kv_offload_tiering_fs_used_bytes"] == 2 * _BLOCK_BYTES
+
+        # Counters are deltas, so the next poll reports no new evictions.
+        assert "vllm:kv_offload_tiering_fs_evictions" not in tier.get_stats().reduce()
+    finally:
+        tier.shutdown()
