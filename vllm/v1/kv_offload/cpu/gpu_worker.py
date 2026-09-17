@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
 import functools
 import time
 from collections import deque
@@ -190,6 +191,22 @@ def _canonical_block_sizes(
     return canonical_bytes_per_block
 
 
+def _clear_cuda_error() -> None:
+    """Discard the calling thread's pending CUDA error, if any.
+
+    The CUDART binding exposed by torch only wraps a handful of entry points,
+    so reach the runtime through the (already loaded) shared library instead.
+    Clearing is best-effort: a host that cannot resolve the symbol keeps the
+    previous behaviour of warning and carrying on.
+    """
+    try:
+        cudart = ctypes.CDLL(None)
+        cudart.cudaGetLastError.restype = ctypes.c_int
+        cudart.cudaGetLastError()
+    except (AttributeError, OSError) as exc:
+        logger.debug("Could not clear the pending CUDA error: %s", exc)
+
+
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
     if not current_platform.is_cuda_alike():
@@ -205,11 +222,11 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     base_ptr = region._base.data_ptr()
     result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
     if result.value != 0:
-        # A failed cudaHostRegister leaves a sticky CUDA error in the calling
+        # A failed cudaHostRegister leaves its error pending on the calling
         # thread. Clear it here, otherwise the next CUDA op in this thread
-        # (e.g. the JIT warmup's first tensor allocation) fails with
-        # "CUDA error: invalid argument" even though it is unrelated.
-        torch.cuda.cudart().cudaGetLastError()
+        # (e.g. the JIT warmup's first tensor allocation) reports it as its
+        # own failure ("CUDA error: invalid argument").
+        _clear_cuda_error()
         logger.warning(
             "cudaHostRegister failed for rank=%d (code=%d) — "
             "transfers will still work but may be slower (unpinned DMA)",
