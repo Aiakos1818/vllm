@@ -205,6 +205,11 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     base_ptr = region._base.data_ptr()
     result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
     if result.value != 0:
+        # A failed cudaHostRegister leaves a sticky CUDA error in the calling
+        # thread. Clear it here, otherwise the next CUDA op in this thread
+        # (e.g. the JIT warmup's first tensor allocation) fails with
+        # "CUDA error: invalid argument" even though it is unrelated.
+        torch.cuda.cudart().cudaGetLastError()
         logger.warning(
             "cudaHostRegister failed for rank=%d (code=%d) — "
             "transfers will still work but may be slower (unpinned DMA)",
