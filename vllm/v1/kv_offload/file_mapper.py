@@ -115,13 +115,17 @@ class FileMapper:
             canonical_format=canonical_format,
         )
 
+    def get_rank_root(self) -> str:
+        """Root directory holding this rank's block files."""
+        return f"{self.base_path}_r{self.rank}"
+
     def get_file_name(self, key: OffloadKey) -> str:
         """Map an OffloadKey to <base>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash>.bin."""
         hash_hex = get_offload_block_hash(key).hex()
         group_idx = get_offload_group_idx(key)
         subfolder1, subfolder2 = hash_hex[:3], hash_hex[3:5]
         return (
-            f"{self.base_path}_r{self.rank}"
+            f"{self.get_rank_root()}"
             f"/{subfolder1}/{subfolder2}_g{group_idx}/{hash_hex}.bin"
         )
 

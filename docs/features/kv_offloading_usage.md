@@ -162,8 +162,14 @@ The filesystem tier (`type: "fs"`) writes blocks to a filesystem directory.
 | `n_write_threads` | no | `16` | Write-priority I/O threads (store path). |
 | `enable_kv_events` | no | `false` | Publish `BlockStored` KV events (medium `STORAGE`) for successfully stored blocks. Requires KV cache events to be enabled globally. |
 | `locality` | no | unspecified | `LOCAL` or `REMOTE` relative to the publishing vLLM instance. Included in the tier's KV events only when explicitly configured. |
+| `max_bytes` | no | `0` (unbounded) | Byte budget for the directory. Past it, whole blocks are evicted least recently used first, so the tier never fills the filesystem. |
+| `evict_retries` | no | `3` | How many times a store may evict and retry after a full-disk errno (`ENOSPC`/`EDQUOT`/`EIO`). Only used with `max_bytes`. |
 
 Each thread group prefers its own queue but pulls from the other when its primary queue is empty, so a write-heavy or read-heavy burst won't leave the off-priority queue waiting. Size the totals to your storage's effective concurrency.
+
+Without `max_bytes` the directory keeps every block it has ever spilled and grows with the working set: vLLM never reclaims blocks on its own. Set `max_bytes` to bound it, typically to a fraction of the partition so the sparse cases still fit. Eviction runs on the tier's I/O threads, so it never blocks the scheduler, and it is lazy — a store evicts only what it needs, which keeps the newest chains intact for reuse.
+
+Recency is the block file's mtime, refreshed when a load restores the block. A promotion copies the block into the CPU tier and leaves the file in place, so a block that keeps being restored is a block worth keeping; the ordering also survives a restart, since it is read back from disk. Because the tier cannot tell which blocks another process is still reading, a byte budget assumes it owns the directory (and its rank subdirectory) — leave `max_bytes` unset when several instances share one `root_dir`. With `max_bytes` set, the tier reports `vllm:kv_offload_tiering_fs_used_bytes`, `vllm:kv_offload_tiering_fs_evictions`, `vllm:kv_offload_tiering_fs_evicted_bytes`, and `vllm:kv_offload_tiering_fs_skipped_store_bytes`.
 
 #### On-Disk Layout
 
